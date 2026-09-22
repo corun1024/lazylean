@@ -10,7 +10,9 @@ thunks, after Coq's `cClosure`.
 
 The difference shows up on proofs that compute. On the Lean Kernel Arena's performance suite
 lazylean is the fastest checker on 23 tests taken together, on one thread, in a fifth of the
-memory. On the Four Colour Theorem's 201 672-declaration dependency closure it needs 3.9
+memory; on whole-library corpora such as Mathlib it is faster than Lean's kernel and slower
+than the multi-threaded specialised checkers. On the Four Colour Theorem's 201 672-declaration
+dependency closure it needs 3.9
 core-hours where Lean's kernel needs 7.5, and where Lean's kernel dies at 178 GB on a raw port
 of Gonthier's reducibility check, lazylean finishes it in 21 GB.
 
@@ -238,9 +240,23 @@ The computation-heavy tests are where the machine wins, and they are most of the
 losses are honest ones: app-lam and beta-ladder are DAG-shaped terms where the hash of a lazy
 closure is recomputed too often, grind-ring-5 is dominated by the per-declaration setup on 2 185
 small declarations, and the two string tests spend their time interning `String.mk` character
-lists. Over the arena's whole bundle of 191 exports, soundness bugs and corner cases included,
-the totals are Lean's kernel 85.2 s, eink0rn 57.5 s, nanoclo 83.1 s and lazylean 26.2 s (measured
-with the build before fusion; the suite total above is the current one).
+lists.
+
+The arena's own harness, run from the fork on a 64-thread EPYC 7B13 on 22 September 2026
+(`results/lazylean-2026-09-22.json` on the branch), agrees on the suite and adds the whole-library
+corpora, which are a different kind of work: hundreds of thousands of small declarations and
+almost no computation. There the two specialised checkers, which also use several threads, are
+ahead, and lazylean sits between them and Lean's kernel. No checker gave a wrong verdict on any
+of the 218 tests.
+
+| | Lean kernel | eink0rn (8 threads) | nanoclo (4 threads) | lazylean (1 thread) |
+|---|---|---|---|---|
+| 25 performance tests, total | 80.7 s | 51.2 s | 86.9 s | 19.0 s |
+| Init (58 135 declarations) | 57 s | 13 s | 7 s | 47 s |
+| Std | 99 s | 23 s | 12 s | 87 s |
+| con-leche | 100 s | 301 s | 16 s | 78 s |
+| CSLib | 415 s | 91 s | 56 s | 396 s |
+| Mathlib (701 682 declarations) | 2436 s | 335 s | 192 s | 1853 s |
 
 ### The Four Colour Theorem
 
