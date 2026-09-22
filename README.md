@@ -10,8 +10,8 @@ thunks, after Coq's `cClosure`.
 
 The difference shows up on proofs that compute. On the Lean Kernel Arena's performance suite
 lazylean is the fastest checker on 23 tests taken together, on one thread, in a fifth of the
-memory; on whole-library corpora such as Mathlib it is faster than Lean's kernel and slower
-than the multi-threaded specialised checkers. On the Four Colour Theorem's 201 672-declaration
+memory. On Mathlib, at the eight workers the fastest other checker uses, it is faster than all
+three. On the Four Colour Theorem's 201 672-declaration
 dependency closure it needs 3.9
 core-hours where Lean's kernel needs 7.5, and where Lean's kernel dies at 178 GB on a raw port
 of Gonthier's reducibility check, lazylean finishes it in 21 GB.
@@ -192,6 +192,33 @@ induction hypothesis the body never mentions is not built at all, which is every
 On ring size 10 of the Four Colour check these took the machine from 393 million steps to 57
 million.
 
+### Checking declarations in parallel
+
+Reducing one term is sequential: each step depends on the last, and no amount of hardware
+changes that. Checking a library is not. Declarations are independent once the ones they cite
+have been established, so `--jobs N` checks them N at a time.
+
+The export is parsed once. After the parse the environment is built and the expression table is
+frozen, and only then does the process fork N workers, so the parsed export and the interned
+permanent tier are shared by every worker through copy-on-write rather than parsed N times. A
+worker walks the declaration list and claims declarations as it reaches them with an atomic
+exchange on a shared flag: it checks what it claims and skips what it does not. Every
+declaration is checked by exactly one worker, and a worker held up by an expensive declaration
+simply claims fewer, so the load balances itself without a scheduler.
+
+Processes rather than threads is a deliberate choice. What threads would buy is shared caches,
+and there is almost nothing to share: the conversion caches are built and discarded per
+declaration, so a worker's own are all it ever uses. What processes buy instead is that no two
+workers can race, in a program whose whole job is to be trusted. The only writable shared
+memory is the array of claim flags.
+
+Parallel checking needs one guarantee that a single process gets for free. Checking a
+declaration against an environment that also holds *later* declarations would accept a circular
+export, where A's proof cites B and B's cites A and neither is ever established; running in
+order, A simply cannot see B. So the order is verified before the workers start: every constant
+a declaration mentions must be introduced by an earlier declaration, or by that same one.
+`--shard` was exposed to this too, and now gets the same check.
+
 ### Two engines
 
 `--engine subst` is the substitution-based reference, Lean's algorithm as such. `--engine kam`
@@ -205,7 +232,9 @@ end.
 ## Performance
 
 All measurements below are on one machine, a 32-core AMD Threadripper 3970X with 126 GB of RAM.
-lazylean is single-threaded throughout. Peak memory is the maximum resident set of the process.
+Reduction inside a declaration is single-threaded in all four checkers; what differs is how many
+declarations each checks at once, which the table states. Peak memory is the maximum resident
+set of the process.
 
 ### The Lean Kernel Arena
 
@@ -337,9 +366,10 @@ GMP is the only dependency (`libgmp-dev`). Exit status 0 means every declaration
 ```
 lazylean -k -v --slow 1 export.ndjson        keep going after a failure, log each declaration,
                                              list the ones slower than 1 s
-lazylean --shard 3/8 export.ndjson           check every 8th declaration starting at the 4th;
-                                             the others are added unchecked, for running one
-                                             export as 8 processes
+lazylean -j 8 export.ndjson                  check with 8 worker processes: the export is
+                                             parsed once and the workers share it
+lazylean --shard 3/8 export.ndjson           check every 8th declaration starting at the 4th,
+                                             for splitting an export over several machines
 lazylean --max-rss 12000 export.ndjson       fail a declaration that exceeds 12 GB instead of
                                              letting the process be killed
 lazylean --progress p.txt export.ndjson      rewrite a one-line status file per declaration
@@ -368,7 +398,8 @@ implemented.
 Fixpoint rules cover self-recursion over one inductive type. Mutual and nested structural
 recursion fall back to the ordinary `brecOn` unfolding, which is correct and slower.
 
-The machine is single-threaded. Large exports are checked as independent shards.
+Reduction is sequential: one enormous term reduces at the speed of one core, and `--jobs` only
+helps an export that has many declarations in it.
 
 ## Provenance and license
 

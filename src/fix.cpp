@@ -291,6 +291,8 @@ static bool skipped(Name n) {
 const FixRule* fix_rule(const Environment& env, const ConstInfo& c) {
   if (!g_fix) return nullptr;
   if (c.fix_idx < 0 && skipped(c.name)) { slot_for(c).state = 4; return nullptr; }
+  // not yet worth a derivation and its verification: unfold the definition as usual
+  if (unfold_count(c.name) < g_fix_min && slot_for(c).state == 0) return nullptr;
   Slot& s = slot_for(c);
   if (s.state == 2 || s.state == 3) return &s.rule;
   if (s.state != 0) return nullptr;

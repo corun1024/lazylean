@@ -12,6 +12,10 @@
 #include <sys/resource.h>
 #include <cstdlib>
 #include <malloc.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <atomic>
 
 namespace ll { extern bool g_strict_metadata; }
 void dump_census();
@@ -37,7 +41,120 @@ struct Options {
   std::string stop_at;   // stop after this declaration
   long from_line = 0;    // declarations before this line are added without checking
   unsigned shard = 0, nshards = 1;   // check only declarations with index % nshards == shard
+  unsigned jobs = 1;     // worker processes, forked after the export is parsed
 };
+
+
+// ---------------------------------------------------------------- parallel checking
+//
+// Declarations are checked by `--jobs N` worker processes forked after the export has been
+// parsed, so the parse and the interning of the permanent tier happen once and the workers
+// share them read-only through copy-on-write.  Each worker walks the whole declaration list in
+// order, exactly as a single process does, claiming declarations as it reaches them: a claimed
+// declaration is checked, an unclaimed one is added to the worker's own environment unchecked.
+// Claiming is an atomic exchange on a shared flag, so every declaration is checked by exactly
+// one worker, and a worker held up by an expensive declaration simply claims fewer.
+struct Shared {
+  std::atomic<unsigned char> stop;       // set when a worker rejects and the run is to end
+  std::atomic<unsigned char> claim[1];   // one flag per declaration, allocated past the struct
+};
+struct WorkerAbort { std::atomic<unsigned char> stop; };
+struct WorkerResult {
+  size_t ok, failed, unchecked, steps, peak_exprs;
+  double check_time;
+  long max_rss_kb;
+  int status;        // 0 fine, 1 a declaration was rejected, 2 declined, 3 the worker died
+};
+
+// Checking a declaration against an environment that already holds *later* declarations would
+// accept a circular export (A's proof cites B, B's cites A, neither ever established).  A
+// single process is protected by construction, because a later constant is simply not there
+// yet.  Workers are not, so the order is verified once, up front: every constant a declaration
+// mentions must be introduced by an earlier declaration, or by that same declaration.
+// Add a declaration's constants without checking them (the loader's data, plus the two fields
+// the checker derives on the way in).
+static void add_unchecked(Environment& env, const Decl& d) {
+  for (auto c : d.consts) {
+    if (c.kind == CKind::Rec) {
+      Expr t = c.type; u32 idx = 0;
+      while (is_pi(t)) { if (idx == c.rec_major_idx()) { Expr I = get_app_fn(binding_dom(t)); if (is_const(I)) c.major_induct = const_name(I); } t = binding_body(t); idx++; }
+    }
+    if (c.kind == CKind::Quot && c.quot_kind == QuotKind::Ind) env.quot_init = true;
+    env.add(c);
+  }
+}
+
+static Shared* g_shared = nullptr;         // claim flags, shared with the workers
+static WorkerResult* g_results = nullptr;  // one slot per worker
+static int g_worker = -1;                  // this process's worker index, -1 = not a worker
+
+// Finish a worker.  A forked worker runs on the copy of the checking thread and has no main
+// thread to return to, so it reports through shared memory and leaves by _Exit.
+[[noreturn]] static void worker_exit(size_t ok, size_t failed, size_t unchecked, size_t steps,
+                                     size_t peak_exprs, double check_time) {
+  WorkerResult& r = g_results[g_worker];
+  r.ok = ok; r.failed = failed; r.unchecked = unchecked; r.steps = steps;
+  r.peak_exprs = peak_exprs; r.check_time = check_time;
+  struct rusage ru; getrusage(RUSAGE_SELF, &ru); r.max_rss_kb = ru.ru_maxrss;
+  r.status = failed ? 1 : 0;
+  std::cerr.flush();
+  std::_Exit(failed ? 1 : 0);
+}
+
+static bool check_topological_order(const ExportFile& ef) {
+  std::vector<u32> intro;   // Name -> 1 + index of the declaration that introduces it
+  auto note = [&](Name n, size_t i) {
+    if (n >= intro.size()) intro.resize(std::max<size_t>(n + 1, intro.size() * 2 + 1024), 0);
+    if (!intro[n]) intro[n] = (u32)i + 1;
+  };
+  for (size_t i = 0; i < ef.decls.size(); i++)
+    for (const ConstInfo& c : ef.decls[i].consts) note(c.name, i);
+  // One stamp array for the whole pass, marked with the declaration's index: clearing it per
+  // declaration would cost the size of the expression table each time.
+  std::vector<u32> seen(g_exprs->size(), 0);
+  bool bad = false;
+  for (size_t i = 0; i < ef.decls.size() && !bad; i++) {
+    const Decl& d = ef.decls[i];
+    // an unsafe or partial definition may cite itself; the checker gives it an axiom header
+    bool self_ok = d.kind == Decl::Def && !d.consts.empty() && d.consts[0].safety != Safety::Safe;
+    std::vector<Expr> todo;
+    for (const ConstInfo& c : d.consts) {
+      if (c.type != NIL) todo.push_back(c.type);
+      if (c.value != NIL) todo.push_back(c.value);
+      for (const RecRule& r : c.rules) todo.push_back(r.rhs);
+    }
+    u32 stamp = (u32)i + 1;
+    while (!todo.empty() && !bad) {
+      Expr e = todo.back(); todo.pop_back();
+      if (e >= seen.size() || seen[e] == stamp) continue;
+      seen[e] = stamp;
+      const ExprNode& n = raw(e);
+      switch (n.kind) {
+        case EKind::Const: {
+          u32 at = n.name < intro.size() ? intro[n.name] : 0;
+          if (at == 0) break;                      // not declared here: the checker reports it
+          if (at - 1 < i) break;                   // earlier: fine
+          if (at - 1 == i && self_ok) break;       // the declaration's own constant, allowed here
+          if (at - 1 == i) {
+            bool own = false;
+            for (const ConstInfo& c : d.consts) if (c.name == n.name) own = true;
+            if (own && (d.kind == Decl::Inductive || d.kind == Decl::Quot)) break;   // the block's own names
+          }
+          std::cerr << "FAIL " << name_str(d.consts[0].name) << " (line " << d.line
+                    << "): declaration order: it cites '" << name_str(n.name)
+                    << "', which is only introduced later (declaration " << (at - 1) << ")\n";
+          bad = true;
+          break;
+        }
+        case EKind::App: case EKind::Lam: case EKind::Pi: todo.push_back(n.a); todo.push_back(n.b); break;
+        case EKind::Let: todo.push_back(n.a); todo.push_back(n.b); todo.push_back(n.c); break;
+        case EKind::Proj: todo.push_back(n.b); break;
+        default: break;
+      }
+    }
+  }
+  return !bad;
+}
 
 static int run(const Options& opt) {
   init_names();
@@ -61,7 +178,68 @@ static int run(const Options& opt) {
   if (opt.max_depth) g_max_depth = opt.max_depth;
   if (g_engine == 2 && !getenv("LL_FIX")) g_fix = 0;   // the differential mode compares whnf results syntactically; fixpoint rules change their shape
   g_max_rss_kb = opt.max_rss_mb * 1024;
+
   Environment env;
+  std::vector<pid_t> kids;
+  bool prebuilt = false;
+  // Any mode that checks a declaration against an environment holding declarations it has not
+  // itself checked needs the export's order verified first; a single unsharded process gets the
+  // same guarantee for free, because a later constant is simply not there yet.
+  if ((opt.jobs > 1 || opt.nshards > 1) && !check_topological_order(ef)) return 1;
+  if (opt.jobs > 1) {
+    size_t nd = ef.decls.size();
+    size_t claim_bytes = sizeof(std::atomic<unsigned char>) * (nd + 1);
+    void* cm = mmap(nullptr, claim_bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    void* rm = mmap(nullptr, sizeof(WorkerResult) * opt.jobs, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (cm == MAP_FAILED || rm == MAP_FAILED) { std::cerr << "error: cannot map shared memory for --jobs\n"; return 1; }
+    memset(cm, 0, claim_bytes); memset(rm, 0, sizeof(WorkerResult) * opt.jobs);
+    g_shared = (Shared*)cm; g_results = (WorkerResult*)rm;
+    // Build the environment once, here, so the workers inherit it instead of each walking the
+    // whole declaration list to rebuild it -- that walk does not shrink as workers are added.
+    // Checking a declaration against an environment that also holds the later ones is sound
+    // because the order was just verified: nothing cites a constant introduced after it.
+    double tb = now();
+    size_t nconsts = 0; for (const Decl& d : ef.decls) nconsts += d.consts.size();
+    env.consts.reserve(nconsts * 2 + 1024);   // no reallocation in a worker: it would copy the lot
+    for (const Decl& d : ef.decls) add_unchecked(env, d);
+    prebuilt = true;
+    std::cerr << "environment built in " << (now() - tb) << "s; checking with " << opt.jobs
+              << " worker processes\n";
+    std::cerr.flush();
+    for (unsigned k = 0; k < opt.jobs; k++) {
+      pid_t pid = fork();
+      if (pid == 0) { g_worker = (int)k; kids.clear(); break; }
+      if (pid < 0) { std::cerr << "error: fork failed\n"; return 1; }
+      kids.push_back(pid);
+    }
+    if (g_worker < 0) {
+      // the parent only waits: every declaration is checked by one of the workers
+      WorkerResult tot{}; bool died = false;
+      for (size_t k = 0; k < kids.size(); k++) {
+        int wst = 0; waitpid(kids[k], &wst, 0);
+        if (WIFEXITED(wst) && WEXITSTATUS(wst) == 1) died = died;   // a rejection, reported below
+        if (!WIFEXITED(wst) || WEXITSTATUS(wst) > 1) {
+          std::cerr << "FAIL worker " << k << " died ("
+                    << (WIFSIGNALED(wst) ? "signal " + std::to_string(WTERMSIG(wst))
+                                         : "exit " + std::to_string(WEXITSTATUS(wst))) << ")\n";
+          died = true;
+        }
+        const WorkerResult& r = g_results[k];
+        tot.ok += r.ok; tot.failed += r.failed; tot.unchecked += r.unchecked; tot.steps += r.steps;
+        tot.peak_exprs = std::max(tot.peak_exprs, r.peak_exprs);
+        tot.max_rss_kb = std::max(tot.max_rss_kb, r.max_rss_kb);
+        tot.check_time = std::max(tot.check_time, r.check_time);
+      }
+      double wall = now() - t1;
+      double cpu = 0; for (size_t k = 0; k < kids.size(); k++) cpu += g_results[k].check_time;
+      std::cerr << "checked " << tot.ok << " declarations, " << tot.failed << " failed, in "
+                << wall << "s wall (" << (cpu / 3600) << " core-hours over " << opt.jobs
+                << " workers); " << tot.steps << " reduction steps; peak " << (tot.max_rss_kb / 1024)
+                << " MB in one worker\n";
+      return (died || tot.failed) ? 1 : 0;
+    }
+  }
+
   size_t ok = 0, failed = 0, unchecked = 0;
   CheckStats st;
   std::vector<std::pair<double, std::string>> slow;
@@ -78,33 +256,34 @@ static int run(const Options& opt) {
     bool check = true;
     size_t my_index = di++;
     if (opt.nshards > 1 && (my_index % opt.nshards) != opt.shard) check = false;
+    // one worker per declaration: whoever reaches it first takes it
+    if (check && g_shared && g_shared->claim[my_index].exchange(1) != 0) check = false;
+    if (g_shared && g_shared->stop.load(std::memory_order_relaxed)) break;   // another worker rejected
     if (!opt.only.empty() && nm != opt.only) check = false;
     if (!trusted.empty() && trusted.count(nm)) check = false;
     if (opt.from_line && (long)d.line < opt.from_line) check = false;
     double s = now();
     if (check && !opt.progress.empty()) {
-      FILE* pf = fopen(opt.progress.c_str(), "w");
+      FILE* pf = fopen(g_worker >= 0 ? (opt.progress + "." + std::to_string(g_worker)).c_str() : opt.progress.c_str(), "w");
       if (pf) { fprintf(pf, "%zu/%zu line %zu ok %zu failed %zu elapsed %.0fs\n%s\n", my_index, ef.decls.size(), d.line, ok, failed, now() - t1, nm.c_str()); fclose(pf); }
     }
     try {
       if (check) {
+        if (prebuilt) for (const ConstInfo& c : d.consts) env.hide(c.name);   // let check_and_add add them
         check_and_add(env, d, opt.trust_inductives, st);
         ok++;
-      } else {
-        for (auto c : d.consts) {
-          if (c.kind == CKind::Rec) {
-            Expr t = c.type; u32 idx = 0;
-            while (is_pi(t)) { if (idx == c.rec_major_idx()) { Expr I = get_app_fn(binding_dom(t)); if (is_const(I)) c.major_induct = const_name(I); } t = binding_body(t); idx++; }
-          }
-          if (c.kind == CKind::Quot && c.quot_kind == QuotKind::Ind) env.quot_init = true;
-          env.add(c);
-        }
+      } else if (!prebuilt) {
+        add_unchecked(env, d);
         unchecked++;
       }
     } catch (KernelError& e) {
       failed++;
       std::cerr << "FAIL " << nm << " (line " << d.line << "): " << e.what() << "\n";
-      if (!opt.keep_going) return 1;
+      if (!opt.keep_going) {
+        if (g_shared) g_shared->stop.store(1, std::memory_order_relaxed);
+        if (g_worker >= 0) worker_exit(ok, failed, unchecked, st.steps, peak_exprs, now() - t1);
+        return 1;
+      }
       // A failed declaration may have left a lot of capacity behind: give it back, so that the
       // resident-set limit does not keep tripping on the declarations that follow.
       g_lctx.decls.clear(); g_exprs->trim(); kam_pools_trim(); malloc_trim(0);
@@ -123,6 +302,7 @@ static int run(const Options& opt) {
     if (!opt.stop_at.empty() && nm == opt.stop_at) break;
   }
   double t2 = now();
+  if (g_worker >= 0) worker_exit(ok, failed, unchecked, st.steps, peak_exprs, t2 - t1);
   std::cerr << "checked " << ok << " declarations, " << failed << " failed, " << unchecked << " added unchecked, in "
             << (t2 - t1) << "s; " << st.steps << " reduction steps; " << g_exprs->size() << " exprs live"
             << (g_engine == 2 ? "; engine mismatches: " + std::to_string(g_engine_mismatches) : std::string("")) << "\n";
@@ -181,6 +361,7 @@ int main(int argc, char** argv) {
     else if (a == "--memo") g_memo = 1;
     else if (a == "--strict-metadata") g_strict_metadata = true;
     else if (a == "--no-memo") g_memo = 0;
+    else if ((a == "-j" || a == "--jobs") && i + 1 < argc) opt.jobs = (unsigned)atoi(argv[++i]);
     else if (a == "--shard" && i + 1 < argc) { std::string s = argv[++i]; size_t p = s.find('/'); opt.shard = atoi(s.substr(0, p).c_str()); opt.nshards = atoi(s.substr(p + 1).c_str()); }
     else if (a == "--engine" && i + 1 < argc) { std::string e = argv[++i]; g_engine = e == "subst" ? 0 : e == "kam" ? 1 : e == "both" ? 2 : atoi(e.c_str()); }
     else if (a[0] == '-') { std::cerr << "unknown option " << a << "\n"; return 2; }

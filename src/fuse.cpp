@@ -9,6 +9,14 @@
 namespace ll {
 
 int g_fuse = getenv("LL_FUSE") ? atoi(getenv("LL_FUSE")) : 1;
+unsigned g_fuse_min = getenv("LL_FUSE_MIN") ? (unsigned)atoi(getenv("LL_FUSE_MIN")) : 1;
+unsigned g_fix_min = getenv("LL_FIX_MIN") ? (unsigned)atoi(getenv("LL_FIX_MIN")) : 0;
+static std::vector<unsigned> g_unfolds;
+unsigned bump_unfolds(Name n) {
+  if (n >= g_unfolds.size()) g_unfolds.resize(std::max<size_t>(n + 1, g_unfolds.size() * 2 + 1024), 0);
+  return ++g_unfolds[n];
+}
+unsigned unfold_count(Name n) { return n < g_unfolds.size() ? g_unfolds[n] : 0; }
 static int g_fuse_iota = getenv("LL_FUSE_IOTA") ? atoi(getenv("LL_FUSE_IOTA")) : 1;
 static int g_fuse_reg = getenv("LL_FUSE_REG") ? atoi(getenv("LL_FUSE_REG")) : 0;   // inlining regular definitions at call sites is not canonical: off by default
 static int g_fuse_lamcheap = getenv("LL_FUSE_LAMCHEAP") ? atoi(getenv("LL_FUSE_LAMCHEAP")) : 1;

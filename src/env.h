@@ -60,6 +60,13 @@ struct Environment {
   bool contains(Name n) const { return find(n) != nullptr; }
   size_t mark() const { return consts.size(); }
   void rollback(size_t m) { while (consts.size() > m) { by_name[consts.back().name] = 0; index.erase(consts.back().name); consts.pop_back(); } }
+  // Make a constant unreachable again so that checking the declaration that introduces it can
+  // add it as usual.  Used when the whole environment was built before the workers forked: the
+  // entry stays in `consts` but nothing can find it, and `add` then appends the checked one.
+  void hide(Name n) {
+    if (n < by_name.size()) by_name[n] = 0;
+    index.erase(n);
+  }
   void add(ConstInfo c) {
     if (contains(c.name)) fail("constant already declared: " + name_str(c.name));
     if (c.name >= by_name.size()) by_name.resize(std::max<size_t>(c.name + 1, by_name.size() * 2 + 1024), 0);

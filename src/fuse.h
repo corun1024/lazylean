@@ -26,6 +26,14 @@ namespace ll {
 Expr fuse_term(const Environment& env, std::unordered_map<Expr, Expr>& cache, Expr e);
 
 bool is_nat_prim(Name f);   // a Nat primitive the machine computes with GMP: never unfolded, never given a fixpoint rule
+// Fusion and fixpoint rules cost a tree walk and a verification per definition, and only repay
+// on a definition that is evaluated repeatedly.  Across a library most definitions are unfolded
+// once or twice, so both are held back until a constant has been unfolded often enough to be
+// worth it.  The count is global and monotone, and the decision for one declaration is frozen by
+// the per-declaration unfold cache, so a term keeps one shape while it is being checked.
+unsigned bump_unfolds(Name n);       // count this unfold, return the new count
+unsigned unfold_count(Name n);
+extern unsigned g_fuse_min, g_fix_min;
 extern int g_fuse;   // LL_FUSE=0 disables
 extern u64 g_fuse_bodies, g_fuse_unfolds, g_fuse_betas, g_fuse_iotas, g_fuse_projs, g_fuse_overflows;
 
