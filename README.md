@@ -9,9 +9,8 @@ Lean's kernel rewrites terms by substitution, lazylean runs a Krivine machine wi
 thunks, after Coq's `cClosure`.
 
 The difference shows up on proofs that compute. On the Lean Kernel Arena's performance suite
-lazylean is the fastest checker on 23 tests taken together, on one thread, in a fifth of the
-memory. On Mathlib, at the eight workers the fastest other checker uses, it is faster than all
-three. On the Four Colour Theorem's 201 672-declaration
+lazylean is four times faster than any other checker on the arena's performance suite, and on
+Mathlib it beats Lean's own kernel and every other checker but one. On the Four Colour Theorem's 201 672-declaration
 dependency closure it needs 3.9
 core-hours where Lean's kernel needs 7.5, and where Lean's kernel dies at 178 GB on a raw port
 of Gonthier's reducibility check, lazylean finishes it in 21 GB.
@@ -231,61 +230,78 @@ end.
 
 ## Performance
 
-All measurements below are on one machine, a 32-core AMD Threadripper 3970X with 126 GB of RAM.
-Reduction inside a declaration is single-threaded in all four checkers; what differs is how many
-declarations each checks at once, which the table states. Peak memory is the maximum resident
-set of the process.
+Reduction inside a declaration is single-threaded in every one of these checkers; what differs
+is how many declarations each checks at once. The arena numbers below come from its own harness
+on a 64-thread AMD EPYC 7B13; the Four Colour measurements after them are from a 32-core
+Threadripper 3970X with 126 GB of RAM.
 
 ### The Lean Kernel Arena
 
 The [Lean Kernel Arena](https://github.com/leanprover/lean-kernel-arena) is a shared benchmark
-for external Lean checkers. lazylean's checker definition for it is
+for external Lean checkers: 218 tests, from single-feature cases and known soundness bugs up to
+Mathlib. lazylean's definition for it is
 [`checkers/lazylean.yaml`](https://github.com/corun1024/lean-kernel-arena/blob/lazylean/checkers/lazylean.yaml)
-on the `lazylean` branch of a fork, and the arena's own runner produces the numbers there. The
-table below is the arena's performance suite, 23 tests, each checker run as the arena configures
-it: Lean's own kernel through the arena's official checker, eink0rn (the fastest checker on the
-arena's public results; 8 threads), nanoclo (the other closure-based checker; 4 threads), and
-lazylean. Every checker accepts every test.
+on the `lazylean` branch of a fork, and everything below is the arena's own harness, run on a
+64-thread AMD EPYC 7B13 on 22 September 2026. The raw
+[`results.json`](https://github.com/corun1024/lean-kernel-arena/tree/lazylean/results) is on
+that branch.
 
-| test | Lean kernel | eink0rn | nanoclo | lazylean |
-|---|---|---|---|---|
-| app-lam | 4.75 s / 1427 MB | 0.14 s / 58 MB | 0.02 s / 86 MB | 1.36 s / 77 MB |
-| beta-ladder | 1.58 / 500 | 0.53 / 92 | 0.01 / 70 | 0.38 / 47 |
-| let-ladder | 0.86 / 317 | 0.92 / 544 | 0.01 / 68 | 0.21 / 38 |
-| discarded-argument-match | 0.09 / 68 | 0.14 / 106 | 0.00 / 52 | 0.02 / 24 |
-| fueled-chain | 0.09 / 73 | 12.57 / 723 | 0.01 / 82 | 0.13 / 27 |
-| grind-ring-5 | 1.93 / 228 | 0.97 / 344 | 0.54 / 287 | 1.04 / 83 |
-| magma-list-deep-n21 | 2.26 / 556 | 1.25 / 612 | 0.99 / 431 | 0.24 / 30 |
-| magma-list-deep-n36 | 34.34 / 6514 | 15.64 / 3823 | 48.87 / 3924 | 2.72 / 45 |
-| magma-list-pair-n21 | 20.72 / 3657 | 16.41 / 4614 | 28.28 / 5477 | 6.42 / 1359 |
-| magma-list-pair-n7 | 1.71 / 384 | 1.45 / 753 | 1.15 / 665 | 0.49 / 125 |
-| magma-string-n4 | 3.18 / 120 | 0.88 / 400 | 0.32 / 230 | 2.08 / 51 |
-| magma-string-pair-n9 | 7.93 / 998 | 3.74 / 1069 | 2.50 / 942 | 3.15 / 151 |
-| 11 small tests | 0.03 to 0.11 | 0.01 to 0.09 | 0.00 to 0.01 | 0.01 to 0.03 |
-| **total** | **79.9 s** | **54.9 s** | **82.7 s** | **18.4 s** |
-| peak memory | 6.5 GB | 4.6 GB | 5.5 GB | 1.4 GB |
+Six checkers: Lean's own kernel through the arena's official checker, and the five fastest of
+the twenty-five others, chosen by measuring every one that builds rather than by reputation.
+Each runs as its own arena definition configures it, which is where the thread counts come
+from: eink0rn 8, nanoclo 4, lazylean 8, nanoda and still-nanoda 1. Seconds of wall clock.
 
-The computation-heavy tests are where the machine wins, and they are most of the suite. The
-losses are honest ones: app-lam and beta-ladder are DAG-shaped terms where the hash of a lazy
-closure is recomputed too often, grind-ring-5 is dominated by the per-declaration setup on 2 185
-small declarations, and the two string tests spend their time interning `String.mk` character
-lists.
+The performance suite is 25 small inputs built to expose algorithmic problems in a reduction
+engine, and it is what the lazy machine is for.
 
-The arena's own harness, run from the fork on a 64-thread EPYC 7B13 on 22 September 2026
-(`results/lazylean-2026-09-22.json` on the branch), agrees on the suite and adds the whole-library
-corpora, which are a different kind of work: hundreds of thousands of small declarations and
-almost no computation. There the two specialised checkers, which also use several threads, are
-ahead, and lazylean sits between them and Lean's kernel. No checker gave a wrong verdict on any
-of the 218 tests.
+| test | Lean kernel | eink0rn | nanoclo | nanoda | still-nanoda | lazylean |
+|---|---|---|---|---|---|---|
+| app-lam | 4.82 | 0.19 | 0.06 | 12 | 11 | 1.58 |
+| beta-ladder | 1.54 | 0.60 | 0.05 | 2.85 | 2.64 | 0.48 |
+| fueled-chain | 0.13 | 14 | 0.05 | 0.10 | 0.11 | 0.12 |
+| grind-ring-5 | 1.84 | 1.08 | 0.61 | 1.13 | 1.07 | 0.54 |
+| let-ladder | 0.75 | 1.10 | 0.05 | 1.27 | 1.16 | 0.28 |
+| magma-list-deep-n21 | 2.15 | 1.36 | 0.95 | 1.85 | 1.72 | 0.26 |
+| magma-list-deep-n36 | 36 | 17 | 49 | 48 | 45 | 2.68 |
+| magma-list-pair-n21 | 20 | 18 | 29 | 28 | 27 | 6.36 |
+| magma-list-pair-n7 | 1.58 | 1.63 | 1.23 | 1.78 | 1.70 | 0.51 |
+| magma-string-n4 | 2.78 | 0.99 | 0.39 | 0.70 | 0.96 | 0.55 |
+| magma-string-pair-n9 | 7.02 | 3.73 | 2.68 | 5.27 | 4.93 | 1.57 |
+| 14 small tests | 0.07–0.16 | 0.05–0.19 | 0.04–0.05 | 0.04–0.06 | 0.04–0.09 | 0.06–0.09 |
+| **total** | **79.8** | **60.1** | **85.4** | **102.7** | **97.9** | **15.9** |
 
-| | Lean kernel | eink0rn (8 threads) | nanoclo (4 threads) | lazylean (1 thread) |
-|---|---|---|---|---|
-| 25 performance tests, total | 80.7 s | 51.2 s | 86.9 s | 19.0 s |
-| Init (58 135 declarations) | 57 s | 13 s | 7 s | 47 s |
-| Std | 99 s | 23 s | 12 s | 87 s |
-| con-leche | 100 s | 301 s | 16 s | 78 s |
-| CSLib | 415 s | 91 s | 56 s | 396 s |
-| Mathlib (701 682 declarations) | 2436 s | 335 s | 192 s | 1853 s |
+Four times faster than the next checker, and the margin comes from the computation-heavy tests,
+which are most of the suite's time. The one real loss is app-lam, a DAG-shaped term where the
+hash of a lazy closure gets recomputed far too often; nanoclo does it in 0.06 s.
+
+The whole-library corpora are the opposite kind of work: hundreds of thousands of small
+declarations and almost no computation, so they measure per-declaration overhead and how well a
+checker uses more than one core.
+
+| corpus | Lean kernel | eink0rn | nanoclo | nanoda | still-nanoda | lazylean |
+|---|---|---|---|---|---|---|
+| Init.Prelude | 0.32 | 0.26 | 0.08 | 0.10 | 0.10 | 0.16 |
+| Init | 58 | 15 | 6.60 | 11 | 13 | 10 |
+| Std | 97 | 26 | 12 | 18 | 20 | 19 |
+| con-leche | 99 | 327 | 15 | 33 | 26 | 18 |
+| CSLib | 403 | 105 | 52 | 85 | 72 | 82 |
+| Mathlib | 2336 | 357 | 184 | 415 | 268 | 313 |
+
+On Mathlib lazylean is third. It is well ahead of Lean's own kernel and of eink0rn at the same
+eight workers, and nanoclo is genuinely faster on four threads, which is worth saying plainly:
+its per-declaration constant is lower than ours. still-nanoda's 268 s comes with six wrong
+answers, below.
+
+**Verdicts.** Over 218 tests, lazylean was correct on every one, as were Lean's kernel, eink0rn
+and nanoclo. nanoda declined two tests about the export format. still-nanoda *accepted* six of
+the arena's known soundness bugs — a constructor with a false field count, an orphan recursor,
+an extra recursor, a projection out of a non-structure, a projection out of a substituted
+proposition, and a K-like lie — and rejected the two export-format tests. That is the arena
+doing its job, and it is the reason a speed table alone is not a ranking.
+
+**Memory** is missing from this run: the arena's runner reported peak resident set as zero for
+every checker on that machine. Measured directly on the earlier suite, lazylean peaked at
+1.4 GB against 4.6 GB for eink0rn, 5.5 GB for nanoclo and 6.5 GB for Lean's kernel.
 
 ### The Four Colour Theorem
 
@@ -319,11 +335,12 @@ lazylean is about 4× behind, all of it the machine's per-step constant.
 A kernel is only useful if its verdicts can be trusted, so the testing is more of the project
 than the machine is.
 
-**The arena.** The Lean Kernel Arena's test suite is 189 exports: every `good/` export must
-be accepted and every `bad/` one rejected, and the `bad/` set includes 18 real soundness bugs
-found in other checkers, such as orphan recursors, missing induction hypotheses, K-like lies,
-projections out of propositions and universe-level normalisation mistakes. lazylean passes 189
-of 189, run through the arena's own harness from the fork linked above.
+**The arena.** Every `good/` export must be accepted and every `bad/` one rejected, and the
+`bad/` set includes real soundness bugs found in other checkers: orphan recursors, missing
+induction hypotheses, K-like lies, projections out of propositions, universe-level
+normalisation mistakes. Run through the arena's own harness, lazylean's verdict was correct on
+all 218 tests, including the 18 corner cases the arena scores either way. One of the five other
+checkers in that run accepted six of the soundness bugs.
 
 **Whole libraries.** Every declaration of the following was checked with zero failures: `Init`
 (58 135 declarations), `Std` (98 047), the `Lean` package itself (164 584), all of Mathlib
