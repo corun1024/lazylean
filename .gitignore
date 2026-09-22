@@ -3,7 +3,4 @@ build-*/
 *.o
 gmon.out
 third_party/
-tests/arena-bundle/good/
-tests/arena-bundle/bad/
-tests/arena-cache/
 tests/exports/init.ndjson

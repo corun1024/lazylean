@@ -21,10 +21,6 @@ scripts was written for this project. The following should be acknowledged:
   [lean4export](https://github.com/leanprover/lean4export) (Apache License
   2.0) so that it reads hexadecimal `Nat` literals; the patch reproduces those
   three lines.
-- `tests/arena-bundle/tests.tar.gz` is the test suite of the
-  [Lean Kernel Arena](https://github.com/leanprover/lean-kernel-arena),
-  Apache License 2.0; its license is included next to it. The tests are
-  redistributed unchanged.
 - `tests/exports/` holds `lean4export` output of `Init.Prelude` from the Lean
   4 standard library (Apache License 2.0) and of this project's own benchmark
   programs.

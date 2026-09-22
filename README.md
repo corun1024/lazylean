@@ -208,10 +208,13 @@ lazylean is single-threaded throughout. Peak memory is the maximum resident set 
 ### The Lean Kernel Arena
 
 The [Lean Kernel Arena](https://github.com/leanprover/lean-kernel-arena) is a shared benchmark
-for external Lean checkers. Its performance suite has 23 tests; each checker is run as the
-arena configures it: Lean's own kernel through the arena's official checker, eink0rn (the
-fastest checker on the arena's public results; 8 threads), nanoclo (the other closure-based
-checker; 4 threads), and lazylean. Every checker accepts every test.
+for external Lean checkers. lazylean's checker definition for it is
+[`checkers/lazylean.yaml`](https://github.com/corun1024/lean-kernel-arena/blob/lazylean/checkers/lazylean.yaml)
+on the `lazylean` branch of a fork, and the arena's own runner produces the numbers there. The
+table below is the arena's performance suite, 23 tests, each checker run as the arena configures
+it: Lean's own kernel through the arena's official checker, eink0rn (the fastest checker on the
+arena's public results; 8 threads), nanoclo (the other closure-based checker; 4 threads), and
+lazylean. Every checker accepts every test.
 
 | test | Lean kernel | eink0rn | nanoclo | lazylean |
 |---|---|---|---|---|
@@ -255,39 +258,27 @@ the reducibility certificates, lazylean 2.3 to 3.2 s and 230 to 320 MB.
 
 ### A raw port of Gonthier's `check_reducible`
 
-The repository also contains a direct port of the reference proof's reducibility check, the
-Kempe closure over colouring trees, with none of the certificate machinery the Lean proof uses
-instead. Written into an export as `checkReducible cfNNN = true := Eq.refl true`, one
-configuration per process, it is the closest thing to a like-for-like comparison of the three
-kernels on the computation the original proof actually does.
-
-| configuration | ring size | Coq lazy kernel | Coq VM | Lean kernel | lazylean, first build | lazylean, current |
-|---|---|---|---|---|---|---|
-| cf001 | 6 | 1.1 s | 1.0 s | 4.0 s / 2 GB | 0.9 s / 35 MB | |
-| cf003 | 8 | 1.3 s | 1.0 s | 10 s / 2.9 GB | 3.0 s / 79 MB | |
-| cf006 | 9 | 1.7 s | 1.0 s | 26 s / 4.9 GB | 9.9 s / 161 MB | 0.9 s / 58 MB |
-| cf009 | 10 | 3.1 s | 1.1 s | 92 s / 13 GB | 25 s / 524 MB | 3.5 s / 137 MB |
-| cf015 | 11 | 5.2 s | 1.2 s | 328 s / 43 GB | 139 s / 3.6 GB | 13.0 s / 395 MB |
-| cf020 | 12 | 13 s | 1.6 s | 31 min / 166 GB | 125 s / 2.4 GB | 53 s / 1.2 GB |
-| cf023 | 13 | 51 s | 3.5 s | killed at 178 GB | 513 s / 9.5 GB | 217 s / 4.4 GB |
-| cf110 | 14 | 260 s | 16 s | killed at 178 GB | 44 min / 41 GB | 18 min / 21 GB |
-
-The first build ran the port where Lean's kernel could not, but sat 5 to 10× behind Coq's lazy
-kernel with a memory footprint that grew faster. Fusion, the fixpoint rules and branch
-selection brought ring 10 level with Coq; from ring 12 on lazylean is about 4× behind, and the
-profile now shows nothing but the machine's per-step constant: thunk and environment allocation
-and reference counting, which an OCaml minor heap does for a fraction of the cost.
+[4ct_direct_lean](https://github.com/corun1024/4ct_direct_lean) is a port of Gonthier's Coq
+proof that keeps its computational method: reducibility is settled by running the Kempe-chain
+closure `check_reducible` on each of the 633 configurations inside the kernel, with lazylean as
+the kernel, since Lean's own cannot get past ring size 12 on that computation (166 GB, then
+killed at 178 GB). That repository holds the ladder of timings against Coq's lazy kernel and
+Coq's VM. The headline: on the largest configuration, ring size 14, Coq's lazy kernel takes
+260 s, lazylean 18 minutes and 21 GB, and Lean's kernel does not finish. The fusion, fixpoint
+rule and branch-selection work described above came out of that comparison; it took ring 10
+from 393 million machine steps to 57 million and brought it level with Coq, and from ring 12 on
+lazylean is about 4× behind, all of it the machine's per-step constant.
 
 ## How it was tested
 
 A kernel is only useful if its verdicts can be trusted, so the testing is more of the project
 than the machine is.
 
-**The arena bundle.** `tests/run_bundle.sh` runs the Lean Kernel Arena's 189 pre-generated
-exports: every `good/` export must be accepted and every `bad/` one rejected. The `bad/` set
-includes 18 real soundness bugs found in other checkers, such as orphan recursors, missing
-induction hypotheses, K-like lies, projections out of propositions and universe-level
-normalisation mistakes. lazylean passes 189 of 189.
+**The arena.** The Lean Kernel Arena's test suite is 189 exports: every `good/` export must
+be accepted and every `bad/` one rejected, and the `bad/` set includes 18 real soundness bugs
+found in other checkers, such as orphan recursors, missing induction hypotheses, K-like lies,
+projections out of propositions and universe-level normalisation mistakes. lazylean passes 189
+of 189, run through the arena's own harness from the fork linked above.
 
 **Whole libraries.** Every declaration of the following was checked with zero failures: `Init`
 (58 135 declarations), `Std` (98 047), the `Lean` package itself (164 584), all of Mathlib
@@ -337,7 +328,7 @@ lazylean --max-rss 12000 export.ndjson       fail a declaration that exceeds 12 
                                              letting the process be killed
 lazylean --progress p.txt export.ndjson      rewrite a one-line status file per declaration
 lazylean --memo export.ndjson                memoise open applications by their read-back
-                                             (the Four Colour certificates want this)
+                                             (the Four Colour Theorem's certificates want this)
 lazylean --engine both export.ndjson         differential mode, see above
 lazylean --print Nat.add export.ndjson       print a declaration's type and value
 ```
@@ -347,11 +338,10 @@ To produce an export: `lean4export Module -- decl > out.ndjson` from the
 project. `Nat` literals beyond a few thousand bits make its decimal printer quadratic;
 `scripts/hexparse_patch.py` teaches it hexadecimal.
 
-Reproducing the numbers: `tests/perfsuite.sh` times the arena suite on this machine,
-`tests/headtohead.sh` compares against the official checker, and `scripts/` holds the remote
-recipes used for Mathlib, the Four Colour export and the arena bundle on a rented machine.
-`tests/synth_decide.py` writes `decide`-style theorems straight into an export for the raw
-reducibility ladder.
+Reproducing the numbers: the arena fork runs the arena suite (`uv run lka.py run lazylean`),
+`scripts/` holds the remote recipes used for Mathlib, Std and Lean's test suite on a rented
+machine, and `tests/fuzz_diff.py` needs an arena checkout for the official checker it uses as
+its oracle.
 
 ## Limitations
 

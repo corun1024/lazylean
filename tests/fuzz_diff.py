@@ -5,7 +5,7 @@ what the kernel rejects is a soundness bug; the converse a completeness bug.
 Usage: fuzz_diff.py export.ndjson N [seed]      (results in ~/ll-tmp/fuzz/)"""
 import json, random, subprocess, sys, os, hashlib
 SRC, N = sys.argv[1], int(sys.argv[2]); seed = int(sys.argv[3]) if len(sys.argv) > 3 else 1
-OFF = os.path.expanduser(os.environ.get("FUZZ_OFFICIAL", "~/dev/lean-kernel-arena/checkers/official/.lake/build/bin/kernel"))
+OFF = os.path.expanduser(os.environ.get("FUZZ_OFFICIAL", "~/lean-kernel-arena/checkers/official/.lake/build/bin/kernel"))
 LL = os.path.expanduser(os.environ.get("FUZZ_LAZYLEAN", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "build", "lazylean")))
 OUT = os.path.expanduser(os.environ.get("FUZZ_OUT", "~/ll-tmp/fuzz")); os.makedirs(OUT, exist_ok=True)
 lines = open(SRC).read().splitlines()
