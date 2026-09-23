@@ -9,11 +9,11 @@ Lean's kernel rewrites terms by substitution, lazylean runs a Krivine machine wi
 thunks, after Coq's `cClosure`.
 
 The difference shows up on proofs that compute. On the Lean Kernel Arena's performance suite
-lazylean is four times faster than any other checker on the arena's performance suite, and on
-Mathlib it beats Lean's own kernel and every other checker but one. On the Four Colour Theorem's 201 672-declaration
-dependency closure it needs 3.9
-core-hours where Lean's kernel needs 7.5, and where Lean's kernel dies at 178 GB on a raw port
-of Gonthier's reducibility check, lazylean finishes it in 21 GB.
+lazylean is four times faster than any other checker, and it checks all of Mathlib, 654 504
+declarations, in 102 seconds on eight cores. On the Four Colour Theorem's 201 672-declaration
+dependency closure it needs 3.9 core-hours where Lean's kernel needs 7.5, and where Lean's
+kernel dies at 178 GB on a raw port of Gonthier's reducibility check, lazylean finishes it in
+21 GB.
 
 ```
 lean4export Foo -- Foo.theorem > foo.ndjson
@@ -191,6 +191,48 @@ induction hypothesis the body never mentions is not built at all, which is every
 On ring size 10 of the Four Colour check these took the machine from 393 million steps to 57
 million.
 
+**Only where they pay.** On a library, fusion and fixpoint rules cost more than they save: most
+declarations evaluate nothing, and fusing every definition they unfold, plus fusing both sides
+of every conversion check, cost 21% of Mathlib's checking time while halving a step count that
+was never the problem. So every declaration is first checked with neither. That attempt counts
+the compiled-recursion wrappers it unfolds (`brecOn`, matchers, `casesOn`), which is what
+evaluating a recursive function on data looks like, and a declaration that unfolds more than
+20 000 of them is abandoned and checked again from scratch with both on. Each attempt is
+consistent in itself, so no term is ever compared with a fused copy of itself. The count is a
+sharp separator: the heaviest declarations in a sixteenth of Mathlib unfold under 28 000
+wrappers and gain nothing from fusion, while the arena tests it helps unfold 196 000 to ten
+million. A step-count budget does not separate them, since thousands of Mathlib declarations run
+hundreds of thousands of steps doing unification-like work that fusion cannot shorten.
+
+### Loading and interning
+
+Checking a library is mostly building terms. On Mathlib the checker interns about 7 000 new
+nodes per declaration, and before this was tuned, two thirds of all checking time went to the
+expression table rather than to reduction. Three things made it cheap.
+
+A node whose child is a temporary term cannot equal anything in the permanent tier, because a
+temporary handle only exists when no equal permanent node did. So the probe into the
+permanent table, a gigabyte of random access for Mathlib, is skipped for it. The same holds for
+a closure whose materialisation contains a temporary term, typically the free variable a binder
+was just instantiated with, and the semantic hash already visits exactly those positions, so it
+reports the fact for free. On a sixteenth of Mathlib this cut permanent probes from 124 million
+to 58 million with the number of hits unchanged to the last digit: every probe skipped was a
+miss. The permanent tier also sits on 2 MB pages, since with 4 KB pages nearly every lookup in it
+missed the TLB as well as the cache.
+
+The per-declaration caches are flat open-addressing tables instead of `std::unordered_map`,
+which allocated and freed a node per entry, and a temporary intern table is emptied by the
+slots it used rather than by its capacity. Universe instantiation, which Mathlib does millions
+of times, skips every subterm that mentions no universe parameter, using a flag each node
+carries.
+
+Loading reads the export through a memory map with a scanner for the line shapes lean4export
+actually writes, falling back to a general JSON reader for anything else. The export writes each
+expression once, so nodes are appended without lookup and the permanent hash table is built
+afterwards by eight threads with compare-and-swap. If two nodes ever turn out equal, the file is
+loaded again with ordinary interning, so equal terms still get one handle. Mathlib's 95 million
+nodes load in 11 seconds.
+
 ### Checking declarations in parallel
 
 Reducing one term is sequential: each step depends on the last, and no amount of hardware
@@ -214,9 +256,12 @@ memory is the array of claim flags.
 Parallel checking needs one guarantee that a single process gets for free. Checking a
 declaration against an environment that also holds *later* declarations would accept a circular
 export, where A's proof cites B and B's cites A and neither is ever established; running in
-order, A simply cannot see B. So the order is verified before the workers start: every constant
-a declaration mentions must be introduced by an earlier declaration, or by that same one.
-`--shard` was exposed to this too, and now gets the same check.
+order, A simply cannot see B. So the order is verified before the workers start: no constant a
+declaration mentions may be introduced by a later declaration. Because the export writes a
+term's parts before the term, one pass over the nodes in order records, for each, the latest
+declaration any constant inside it comes from, and each declaration is then one comparison;
+for Mathlib that is under a second. `--shard` was exposed to the same gap and gets the same
+check.
 
 ### Two engines
 
@@ -230,12 +275,38 @@ end.
 
 ## Performance
 
-Reduction inside a declaration is single-threaded in every one of these checkers; what differs
-is how many declarations each checks at once. The arena numbers below come from its own harness
-on a 64-thread AMD EPYC 7B13; the Four Colour measurements after them are from a 32-core
-Threadripper 3970X with 126 GB of RAM.
+### Version 0.3.0
 
-### The Lean Kernel Arena
+Version 0.3.0 is three times faster than 0.2.0 on Mathlib at the same eight workers, and two
+and a half to three and a half times faster on every other library. Both versions below ran on
+one machine, a 64-thread AMD EPYC 7C13, with the arena's own command line
+(`-j 8 --max-rss 14000`), one after the other. Seconds of wall clock, and no declaration failed
+in any run.
+
+| corpus | declarations | 0.2.0 | 0.3.0 | |
+|---|---|---|---|---|
+| Init | 53 093 | 10.2 | 3.8 | 2.7× |
+| Std | 90 778 | 18.3 | 6.5 | 2.8× |
+| con-leche | 26 819 | 17.7 | 7.5 | 2.4× |
+| CSLib | 370 939 | 86.6 | 25.2 | 3.4× |
+| Mathlib | 654 504 | 323.5 | 102.0 | 3.2× |
+
+On Mathlib the gain splits into loading, 81.5 s to 11.1 s, and checking, 239.5 s to 91.3 s of
+wall time. The design notes above say where each part came from; in order of what they were
+worth on Mathlib, they are the skipped permanent-table probes, checking without fusion unless a
+declaration evaluates, the flat caches, 2 MB pages, the bulk loader, and the cheaper universe
+instantiation. The performance suite did not give anything back: 17.9 s with 0.2.0 and 16.2 s
+now, single process, fastest of three runs. The arena's harness, run on 0.3.0 over all 218
+tests, returns 200 correct verdicts and 18 on the corner cases it scores either way, the same
+as before.
+
+### The Lean Kernel Arena, with 0.2.0
+
+These comparisons predate 0.3.0 and were made on a different machine, a 64-thread AMD EPYC
+7B13, so they understate lazylean on the library corpora; on Mathlib 0.3.0 is three times
+faster than the figure below. Reduction inside a declaration is single-threaded in every one of
+these checkers; what differs is how many declarations each checks at once. The Four Colour
+measurements after them are from a 32-core Threadripper 3970X with 126 GB of RAM.
 
 The [Lean Kernel Arena](https://github.com/leanprover/lean-kernel-arena) is a shared benchmark
 for external Lean checkers: 218 tests, from single-feature cases and known soundness bugs up to
