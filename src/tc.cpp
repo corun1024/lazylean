@@ -28,6 +28,7 @@ void check_rss(const char* where) {
 bool g_trace_depth = getenv("LL_TRACE_DEPTH") != nullptr;
 unsigned g_trace_shallow = getenv("LL_TRACE_SHALLOW") ? atoi(getenv("LL_TRACE_SHALLOW")) : 0;
 u64 g_engine_mismatches = 0;
+u64 g_step_budget = 0, g_decl_work = 0;
 u64 g_cnt_unfold = 0, g_cnt_iota = 0, g_cnt_prefix_hits = 0;
 static std::unordered_set<u64, PairHash> g_defeq_pairs_seen, g_defeq_failed_pairs; u64 g_cnt_defeq_repeat = 0, g_cnt_defeq_refail = 0;   // diagnostics: how often the same pair is compared again
 
@@ -526,6 +527,7 @@ Expr TypeChecker::unfold_definition(Expr e, bool& ok) {
   if (!c || !c->is_delta()) return e;
   if (g_levels->list_size(const_levels(f)) != c->lparams.size()) return e;
   g_cnt_unfold++;
+  if (is_recursion_wrapper(*c)) count_wrapper();
   Expr v = unfold_value(f, *c);
   ok = true; steps++;
   if (g_trace_nat && (c->name == N.Nat_add || c->name == N.Nat_sub || c->name == N.Nat_mul || c->name == N.Nat_mod || c->name == N.Nat_div || c->name == N.Nat_pow || c->name == N.Nat_beq || c->name == N.Nat_ble)) {
@@ -536,7 +538,14 @@ Expr TypeChecker::unfold_definition(Expr e, bool& ok) {
   }
   if (f == e) return v;
   std::vector<Expr> args; get_app_args(e, args);
-  return mk_apps(v, args);
+  // Every caller hands the result straight to whnf_core, whose first step on
+  // (fun x1 .. xk => b) a1 .. an is this beta.  Doing it here skips building and interning the
+  // application spine only to take it apart again.
+  size_t i = 0; Expr b = v;
+  while (i < args.size() && is_lam(b)) { b = binding_body(b); i++; }
+  if (i == 0) return mk_apps(v, args);
+  b = instantiate_rev(b, i, args.data());
+  return mk_apps_range(b, args, i, args.size());
 }
 
 Expr TypeChecker::reduce_nat(Expr e, bool& ok) {

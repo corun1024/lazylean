@@ -84,6 +84,7 @@ static void add_unchecked(Environment& env, const Decl& d) {
   }
 }
 
+static u64 g_fusion_retries = 0;
 static Shared* g_shared = nullptr;         // claim flags, shared with the workers
 static WorkerResult* g_results = nullptr;  // one slot per worker
 static int g_worker = -1;                  // this process's worker index, -1 = not a worker
@@ -103,57 +104,64 @@ static int g_worker = -1;                  // this process's worker index, -1 = 
 
 static bool check_topological_order(const ExportFile& ef) {
   std::vector<u32> intro;   // Name -> 1 + index of the declaration that introduces it
-  auto note = [&](Name n, size_t i) {
-    if (n >= intro.size()) intro.resize(std::max<size_t>(n + 1, intro.size() * 2 + 1024), 0);
-    if (!intro[n]) intro[n] = (u32)i + 1;
-  };
   for (size_t i = 0; i < ef.decls.size(); i++)
-    for (const ConstInfo& c : ef.decls[i].consts) note(c.name, i);
-  // One stamp array for the whole pass, marked with the declaration's index: clearing it per
-  // declaration would cost the size of the expression table each time.
-  std::vector<u32> seen(g_exprs->size(), 0);
-  bool bad = false;
-  for (size_t i = 0; i < ef.decls.size() && !bad; i++) {
-    const Decl& d = ef.decls[i];
-    // an unsafe or partial definition may cite itself; the checker gives it an axiom header
-    bool self_ok = d.kind == Decl::Def && !d.consts.empty() && d.consts[0].safety != Safety::Safe;
-    std::vector<Expr> todo;
-    for (const ConstInfo& c : d.consts) {
-      if (c.type != NIL) todo.push_back(c.type);
-      if (c.value != NIL) todo.push_back(c.value);
-      for (const RecRule& r : c.rules) todo.push_back(r.rhs);
+    for (const ConstInfo& c : ef.decls[i].consts) {
+      Name n = c.name;
+      if (n >= intro.size()) intro.resize(std::max<size_t>(n + 1, intro.size() * 2 + 1024), 0);
+      if (!intro[n]) intro[n] = (u32)i + 1;
     }
-    u32 stamp = (u32)i + 1;
-    while (!todo.empty() && !bad) {
-      Expr e = todo.back(); todo.pop_back();
-      if (e >= seen.size() || seen[e] == stamp) continue;
-      seen[e] = stamp;
-      const ExprNode& n = raw(e);
-      switch (n.kind) {
-        case EKind::Const: {
-          u32 at = n.name < intro.size() ? intro[n.name] : 0;
-          if (at == 0) break;                      // not declared here: the checker reports it
-          if (at - 1 < i) break;                   // earlier: fine
-          if (at - 1 == i && self_ok) break;       // the declaration's own constant, allowed here
-          if (at - 1 == i) {
-            bool own = false;
-            for (const ConstInfo& c : d.consts) if (c.name == n.name) own = true;
-            if (own && (d.kind == Decl::Inductive || d.kind == Decl::Quot)) break;   // the block's own names
-          }
-          std::cerr << "FAIL " << name_str(d.consts[0].name) << " (line " << d.line
-                    << "): declaration order: it cites '" << name_str(n.name)
-                    << "', which is only introduced later (declaration " << (at - 1) << ")\n";
-          bad = true;
-          break;
+  // latest[e] = 1 + the latest declaration that introduces a constant occurring in e (0: none).
+  // The export writes a term's parts before the term, so one pass in handle order computes it
+  // for every node; a declaration is then one comparison, instead of a walk over its terms that
+  // revisits every shared subterm.  What is verified is that nothing cites a later declaration:
+  // a declaration that cites its own constants is rejected by the checker itself, which hides
+  // them while it runs, except where the kernel allows it (an inductive block, an unsafe or
+  // partial definition).
+  const u32 n = (u32)g_exprs->size();
+  std::vector<u32> latest(n, 0);
+  for (u32 e = 0; e < n; e++) {
+    const ExprNode& nd = raw(e);
+    u32 v = 0;
+    auto child = [&](u32 c) -> bool { if (c >= e) return false; v = std::max(v, latest[c]); return true; };
+    bool ok = true;
+    switch (nd.kind) {
+      case EKind::Const: v = nd.name < intro.size() ? intro[nd.name] : 0; break;
+      case EKind::App: case EKind::Lam: case EKind::Pi: ok = child(nd.a) && child(nd.b); break;
+      case EKind::Let: ok = child(nd.a) && child(nd.b) && child(nd.c); break;
+      case EKind::Proj: ok = child(nd.b); break;
+      default: break;
+    }
+    if (!ok) fail("declaration order: a term refers to a later term");   // not possible for a loaded export
+    latest[e] = v;
+  }
+  for (size_t i = 0; i < ef.decls.size(); i++) {
+    const Decl& d = ef.decls[i];
+    u32 worst = 0; Expr at = NIL;
+    auto see = [&](Expr e) { if (e != NIL && e < n && latest[e] > worst) { worst = latest[e]; at = e; } };
+    for (const ConstInfo& c : d.consts) { see(c.type); see(c.value); for (const RecRule& r : c.rules) see(r.rhs); }
+    if (worst > i + 1) {
+      // find the constant, for the message
+      Name bad = 0;
+      std::vector<Expr> todo{at};
+      while (!todo.empty() && !bad) {
+        Expr e = todo.back(); todo.pop_back();
+        const ExprNode& nd = raw(e);
+        if (latest[e] != worst) continue;
+        switch (nd.kind) {
+          case EKind::Const: bad = nd.name; break;
+          case EKind::App: case EKind::Lam: case EKind::Pi: todo.push_back(nd.a); todo.push_back(nd.b); break;
+          case EKind::Let: todo.push_back(nd.a); todo.push_back(nd.b); todo.push_back(nd.c); break;
+          case EKind::Proj: todo.push_back(nd.b); break;
+          default: break;
         }
-        case EKind::App: case EKind::Lam: case EKind::Pi: todo.push_back(n.a); todo.push_back(n.b); break;
-        case EKind::Let: todo.push_back(n.a); todo.push_back(n.b); todo.push_back(n.c); break;
-        case EKind::Proj: todo.push_back(n.b); break;
-        default: break;
       }
+      std::cerr << "FAIL " << name_str(d.consts[0].name) << " (line " << d.line
+                << "): declaration order: it cites '" << (bad ? name_str(bad) : std::string("?"))
+                << "', which is only introduced later (declaration " << (worst - 1) << ")\n";
+      return false;
     }
   }
-  return !bad;
+  return true;
 }
 
 static int run(const Options& opt) {
@@ -177,6 +185,11 @@ static int run(const Options& opt) {
   }
   if (opt.max_depth) g_max_depth = opt.max_depth;
   if (g_engine == 2 && !getenv("LL_FIX")) g_fix = 0;   // the differential mode compares whnf results syntactically; fixpoint rules change their shape
+  const int fuse_default = g_fuse, fix_default = g_fix;
+  // LL_FUSE_BUDGET: wrapper unfoldings before a declaration is rechecked with fusion; 0 turns
+  // the two-attempt scheme off (fusion from the start, as before)
+  const u64 fuse_budget = getenv("LL_FUSE_BUDGET") ? strtoull(getenv("LL_FUSE_BUDGET"), nullptr, 10) : 20000;
+  const bool two_attempts = fuse_budget != 0 && (fuse_default || fix_default);
   g_max_rss_kb = opt.max_rss_mb * 1024;
 
   Environment env;
@@ -185,7 +198,9 @@ static int run(const Options& opt) {
   // Any mode that checks a declaration against an environment holding declarations it has not
   // itself checked needs the export's order verified first; a single unsharded process gets the
   // same guarantee for free, because a later constant is simply not there yet.
-  if ((opt.jobs > 1 || opt.nshards > 1) && !check_topological_order(ef)) return 1;
+  { double to = now();
+    if ((opt.jobs > 1 || opt.nshards > 1) && !check_topological_order(ef)) return 1;
+    if (opt.jobs > 1 || opt.nshards > 1) std::cerr << "declaration order verified in " << (now() - to) << "s\n"; }
   if (opt.jobs > 1) {
     size_t nd = ef.decls.size();
     size_t claim_bytes = sizeof(std::atomic<unsigned char>) * (nd + 1);
@@ -270,13 +285,32 @@ static int run(const Options& opt) {
     try {
       if (check) {
         if (prebuilt) for (const ConstInfo& c : d.consts) env.hide(c.name);   // let check_and_add add them
-        check_and_add(env, d, opt.trust_inductives, st);
+        size_t mark = env.mark();
+        try {
+          if (two_attempts) { g_fuse = 0; g_fix = 0; g_step_budget = fuse_budget; } g_decl_work = 0; g_decl_wrap = 0;
+          u64 d0 = g_k_delta, i0 = g_k_iota, s0 = st.steps;
+          check_and_add(env, d, opt.trust_inductives, st);
+          static const long rep = getenv("LL_WORK_REPORT") ? atol(getenv("LL_WORK_REPORT")) : -1;
+          if (rep >= 0 && (long)(st.steps - s0) >= rep)
+            std::cerr << "WORK " << nm << " steps " << (st.steps - s0) << " delta " << (g_k_delta - d0)
+                      << " wrapper " << g_decl_wrap << " iota " << (g_k_iota - i0) << "\n";
+        } catch (NeedsFusion&) {
+          // it computes: throw the attempt away and check it again with fusion and rules on
+          env.rollback(mark);
+          g_lctx.decls.clear();
+          fix_before_reclaim(); g_exprs->reclaim(); fix_after_reclaim();
+          g_fusion_retries++;
+          g_fuse = fuse_default; g_fix = fix_default; g_step_budget = 0; g_decl_work = 0; g_decl_wrap = 0;
+          check_and_add(env, d, opt.trust_inductives, st);
+        }
+        g_fuse = fuse_default; g_fix = fix_default; g_step_budget = 0;
         ok++;
       } else if (!prebuilt) {
         add_unchecked(env, d);
         unchecked++;
       }
     } catch (KernelError& e) {
+      g_fuse = fuse_default; g_fix = fix_default; g_step_budget = 0;
       failed++;
       std::cerr << "FAIL " << nm << " (line " << d.line << "): " << e.what() << "\n";
       if (!opt.keep_going) {
@@ -311,6 +345,11 @@ static int run(const Options& opt) {
   if (getenv("LL_COUNT_REPEATS")) std::cerr << "defeq pairs compared again: " << g_cnt_defeq_repeat << " (of which previously failed: " << g_cnt_defeq_refail << ")\n";
   std::cerr << "subst engine: unfold " << g_cnt_unfold << ", iota/proj/quot " << g_cnt_iota << "; spine-prefix cache hits " << g_cnt_prefix_hits << "\n";
   std::cerr << "machine: app " << g_k_app << ", bvar " << g_k_bvar << ", beta " << g_k_beta << ", let " << g_k_let << ", delta " << g_k_delta << ", iota " << g_k_iota << ", proj " << g_k_proj << ", enter value/delayed/re-eval " << g_k_enter_val << "/" << g_k_enter_delayed << "/" << g_k_reeval << ", memo hit/insert " << g_k_memo_hit << "/" << g_k_memo_ins << "\n";
+  std::cerr << "declarations rechecked with fusion: " << g_fusion_retries << "\n";
+  { std::cerr << "intern: permanent probes " << g_int_perm_probe << " (hits " << g_int_perm_hit << "), temporary hits " << g_int_temp_hit << ", new " << g_int_new << "; by kind";
+    const char* kn[] = {"bvar","fvar","sort","const","app","lam","pi","let","lit","proj","clos"};
+    for (int i = 0; i < 11; i++) std::cerr << " " << kn[i] << " " << g_int_kind[i];
+    std::cerr << "\n"; }
   if (g_fix) std::cerr << "fixpoint rules: derived " << g_fix_derived << ", rejected " << g_fix_rejected << ", applied " << g_fix_applied << "\n";
   if (g_fuse) std::cerr << "fusion: bodies " << g_fuse_bodies << ", unfolds " << g_fuse_unfolds << ", betas " << g_fuse_betas << ", iotas " << g_fuse_iotas << ", projs " << g_fuse_projs << ", overflows " << g_fuse_overflows << "\n";
   std::cerr << "closures: " << g_cnt_clos << " created, " << g_cnt_expose << " exposed, " << g_cnt_env << " envs, " << g_cnt_clos_compose << " composed, " << g_cnt_clos_expand << " expanded\n";

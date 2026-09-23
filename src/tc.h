@@ -31,7 +31,7 @@ struct PairHash { size_t operator()(u64 k) const { return (size_t)mix(0x1234, k)
 // classes.  Two large terms whose differing subterms were proved equal earlier are then
 // recognised without any reduction (Lean's `equiv_manager`).
 struct EquivManager {
-  std::unordered_map<Expr, Expr> parent;
+  FlatMap<Expr> parent;
   Expr find(Expr e) {
     auto it = parent.find(e); if (it == parent.end()) return e;
     Expr r = it->second; while (true) { auto j = parent.find(r); if (j == parent.end()) break; r = j->second; }
@@ -59,7 +59,7 @@ struct TypeChecker {
   Safety safety = Safety::Safe;
   bool eager = false;
   // caches (live for one declaration)
-  std::unordered_map<Expr, Expr> infer_i, infer_c, whnf_core_cache, whnf_cache, unfold_cache, fuse_cache;
+  FlatMap<Expr> infer_i, infer_c, whnf_core_cache, whnf_cache, unfold_cache, fuse_cache;
   // kam.cpp direct branch selection: the shape of a recursor rule's right-hand side
   // (`fun params motive minors fields => minor fields ih_1 .. ih_r`), and which of a lambda's
   // leading binders occur in its body.
@@ -72,8 +72,8 @@ struct TypeChecker {
   // whnf cache, at thunk granularity.  Opaque pointer to avoid including kam.h here.
   void* closed_thunks = nullptr;
   ~TypeChecker();
-  std::unordered_set<u64, PairHash> defeq_fail;   // lazy delta: same-head pairs whose arguments differ
-  std::unordered_set<u64, PairHash> defeq_neg;    // pairs already found not definitionally equal
+  FlatSet64 defeq_fail;   // lazy delta: same-head pairs whose arguments differ
+  FlatSet64 defeq_neg;    // pairs already found not definitionally equal
   EquivManager eqv;
   unsigned depth = 0;
   unsigned max_depth = g_max_depth;
@@ -161,6 +161,22 @@ Expr nat_lit_or_zero(Expr e, bool& ok, mpz_class& out);  // literal or Nat.zero
 // Declaration checking. Adds to env on success; throws KernelError on failure.
 struct CheckStats { u64 steps = 0; };
 void check_and_add(Environment& env, const Decl& d, bool trust_inductives, CheckStats& st);
+
+// A declaration is first checked without fusion or fixpoint rules, which cost more than they
+// save on the ordinary declarations of a library.  What they pay off on is the evaluation of
+// compiled recursion (brecOn, matchers, casesOn), so an attempt counts how many of those
+// wrappers it unfolds, and one that unfolds more than the budget is abandoned by throwing this
+// and checked again from scratch with both on.  Each attempt is consistent in itself: fusion
+// is on or off for the whole of it.  (Not a KernelError: nothing may mistake it for a verdict.)
+struct NeedsFusion {};
+extern u64 g_step_budget;   // wrapper unfoldings allowed in a fusion-free attempt; 0 = no limit
+extern u64 g_decl_work;
+extern u64 g_decl_wrap;     // wrapper unfoldings in the current attempt (fuse.cpp)
+inline void count_wrapper() {
+  ++g_decl_wrap;
+  if (g_step_budget && g_decl_wrap > g_step_budget) throw NeedsFusion{};
+}
+
 void add_inductive_decl(Environment& env, const Decl& d, bool trust);
 void add_quot_decl(Environment& env, const Decl& d);
 

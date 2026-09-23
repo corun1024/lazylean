@@ -1,4 +1,6 @@
 #include "expr.h"
+#include <thread>
+#include <cstdlib>
 #include <unordered_map>
 #include <algorithm>
 
@@ -18,18 +20,68 @@ ExprTable::ExprTable() {
   stable = new InternTable<SH, SE>(SH{this}, SE{this});
   tstable = new InternTable<SH, SE>(SH{this}, SE{this});
   etable = new InternTable<EH, EE>(EH{this}, EE{this});
+  ttable->track = tntable->track = tstable->track = etable->track = true;
+}
+
+void ExprTable::reserve_permanent(size_t n, bool size_table) {
+  // Room above the permanent tier for the terms a declaration builds: were the array to grow
+  // later, a forked worker would copy the whole shared tier into its own memory.
+  size_t cap = n + std::max<size_t>(n / 4, (size_t)1 << 24);
+  if (nodes.empty()) {
+    std::vector<ExprNode>().swap(nodes);
+    nodes.reserve(cap);
+    advise_huge(nodes.data(), cap * sizeof(ExprNode));
+  } else nodes.reserve(cap);
+  if (size_table) table->reserve(n);
 }
 
 // Look up `cand` (already appended) in the permanent table without inserting.
 template <class T> static u32 find_only(T* t, u32 cand) { return t->find(cand); }
 
+u64 g_int_perm_probe = 0, g_int_perm_hit = 0, g_int_temp_hit = 0, g_int_new = 0;
+u64 g_int_kind[16];
+#ifdef LL_INTERN_STATS
+#define ISTAT(x) (x)
+#else
+#define ISTAT(x) ((void)0)
+#endif
 Expr ExprTable::intern(ExprNode nd) {
+  ISTAT(g_int_kind[(int)nd.kind]++);
+  const bool temp_hint = nd.flags & 0x80;
+  nd.flags &= 0x7f;
   nodes.push_back(nd);
   if ((nodes.size() & 0xfffff) == 0) check_rss("intern");
+  if (bulk) return (u32)nodes.size() - 1;   // indexed later by build_index()
   u32 cand = (u32)nodes.size() - 1;
   u32 r;
   if (!frozen) r = table->intern(cand);
-  else { r = find_only(table, cand); if (r == NIL) r = ttable->intern(cand); }
+  else {
+    // The permanent tier is hash-consed and frozen, and a temporary handle is never equal to a
+    // permanent node (had one existed, interning would have returned it).  So a node with a
+    // temporary child cannot equal any permanent node, and the probe into the permanent table
+    // -- a cache miss into a table of tens of millions of entries -- can be skipped.  A closure
+    // is compared semantically, not by its children, and is always looked up.
+    bool maybe_perm = true;
+    switch (nd.kind) {
+      case EKind::App: case EKind::Lam: case EKind::Pi:
+        maybe_perm = nd.a < wm_nodes && nd.b < wm_nodes; break;
+      case EKind::Let: maybe_perm = nd.a < wm_nodes && nd.b < wm_nodes && nd.c < wm_nodes; break;
+      case EKind::Proj: maybe_perm = nd.b < wm_nodes; break;
+      case EKind::FVar: maybe_perm = false; break;   // the loader never makes free variables
+      case EKind::Clos: maybe_perm = !temp_hint; break;   // its materialisation contains a temporary term
+      default: break;
+    }
+    if (maybe_perm) ISTAT(g_int_perm_probe++);
+    r = maybe_perm ? find_only(table, cand) : NIL;
+    if (r != NIL) ISTAT(g_int_perm_hit++);
+    else {
+#ifdef LL_INTERN_STATS
+      size_t c0 = ttable->count; r = ttable->intern(cand); if (ttable->count != c0) g_int_new++; else g_int_temp_hit++;
+#else
+      r = ttable->intern(cand);
+#endif
+    }
+  }
   // An equality test may have interned further nodes (closures); only pop when still last.
   if (r != cand && cand + 1 == nodes.size()) nodes.pop_back();
   return r;
@@ -61,6 +113,31 @@ u32 ExprTable::intern_str(const std::string& s) {
   if (r != cand) str_lits.pop_back();
   return r;
 }
+bool ExprTable::build_index(unsigned threads) {
+  u32 n = (u32)nodes.size();
+  table->reserve(n);
+  bool dup = false;
+  if (threads < 2 || n < (1u << 20)) table->bulk_insert(0, n, &dup);
+  else {
+    std::vector<std::thread> ts;
+    for (unsigned k = 0; k < threads; k++) {
+      u32 lo = (u32)((u64)n * k / threads), hi = (u32)((u64)n * (k + 1) / threads);
+      ts.emplace_back([this, lo, hi, &dup] { table->bulk_insert(lo, hi, &dup); });
+    }
+    for (auto& t : ts) t.join();
+  }
+  table->count = n;
+  bulk = false;
+  return !dup;
+}
+void ExprTable::reset_permanent() {
+  nodes.clear(); nat_lits.clear(); str_lits.clear();
+  table->slots.assign(table->slots.size(), table->EMPTY); table->count = 0;
+  ntable->slots.assign(ntable->slots.size(), ntable->EMPTY); ntable->count = 0;
+  stable->slots.assign(stable->slots.size(), stable->EMPTY); stable->count = 0;
+  bulk = false;
+}
+
 void ExprTable::freeze() { frozen = true; wm_nodes = nodes.size(); wm_nat = nat_lits.size(); wm_str = str_lits.size(); }
 void ExprTable::reclaim() {
   if (!frozen) return;
@@ -70,8 +147,10 @@ void ExprTable::reclaim() {
   auto reset = [](auto* t, size_t small) {
     if (t->count == 0) return;
     size_t cap = t->slots.size();
-    if (cap > 4 * small && t->count * 8 < cap) t->slots.assign(small, t->EMPTY); else t->slots.assign(cap, t->EMPTY);
-    t->count = 0;
+    // A table grown by one large declaration is shrunk back: a sparse table spread over many
+    // megabytes costs a cache miss per probe for every small declaration that follows.
+    if (cap > 4 * small) { t->slots.assign(small, t->EMPTY); t->dirty.clear(); t->count = 0; }
+    else t->clear_used();
   };
   reset(ttable, 1u << 16); reset(tntable, 1u << 12); reset(tstable, 1u << 12); reset(etable, 1u << 12);
   envs.clear(); env_hash.clear(); env_flags.clear();
@@ -82,10 +161,10 @@ void ExprTable::trim() {
   reclaim();
   nodes.shrink_to_fit(); nat_lits.shrink_to_fit(); str_lits.shrink_to_fit();
   envs.shrink_to_fit(); env_hash.shrink_to_fit(); env_flags.shrink_to_fit();
-  ttable->slots.assign(1u << 16, ttable->EMPTY); ttable->slots.shrink_to_fit(); ttable->count = 0;
-  tntable->slots.assign(1u << 12, tntable->EMPTY); tntable->slots.shrink_to_fit(); tntable->count = 0;
-  tstable->slots.assign(1u << 12, tstable->EMPTY); tstable->slots.shrink_to_fit(); tstable->count = 0;
-  etable->slots.assign(1u << 12, etable->EMPTY); etable->slots.shrink_to_fit(); etable->count = 0;
+  for (auto* t : {ttable}) { t->slots.assign(1u << 16, t->EMPTY); t->slots.shrink_to_fit(); t->count = 0; t->dirty.clear(); t->dirty.shrink_to_fit(); }
+  tntable->slots.assign(1u << 12, tntable->EMPTY); tntable->slots.shrink_to_fit(); tntable->count = 0; tntable->dirty.clear();
+  tstable->slots.assign(1u << 12, tstable->EMPTY); tstable->slots.shrink_to_fit(); tstable->count = 0; tstable->dirty.clear();
+  etable->slots.assign(1u << 12, etable->EMPTY); etable->slots.shrink_to_fit(); etable->count = 0; etable->dirty.clear();
 }
 
 u32 ExprTable::mk_env(const Expr* es, size_t n, bool rev) {
@@ -112,11 +191,11 @@ Expr mk_fvar(u32 id) {
   return g_exprs->intern(ExprNode{EKind::FVar, BInfo::Default, 1, 0, id, 0, 0, 0, 0, hk(EKind::FVar, id)});
 }
 Expr mk_sort(Level l) {
-  return g_exprs->intern(ExprNode{EKind::Sort, BInfo::Default, 0, 0, l, 0, 0, 0, 0, hk(EKind::Sort, lv(l).hash)});
+  return g_exprs->intern(ExprNode{EKind::Sort, BInfo::Default, (u8)(lv(l).has_param ? 2 : 0), 0, l, 0, 0, 0, 0, hk(EKind::Sort, lv(l).hash)});
 }
 Expr mk_const(Name n, LevelList ls) {
   u64 h = hk(EKind::Const, mix((*g_names)[n].hash, ls));
-  return g_exprs->intern(ExprNode{EKind::Const, BInfo::Default, 0, 0, 0, 0, 0, n, ls, h});
+  return g_exprs->intern(ExprNode{EKind::Const, BInfo::Default, (u8)(g_levels->list_has_param(ls) ? 2 : 0), 0, 0, 0, 0, n, ls, h});
 }
 static ExprNode node_app(Expr f, Expr a) {
   const ExprNode nf = raw(f); const ExprNode na = raw(a);
@@ -176,15 +255,29 @@ void clear_sem_memos() { g_memo_gen++; }
 // term would carry.
 u64 ExprTable::sem_hash(Expr t, u32 env, u32 p, u32* lbr_out, u8* flags_out) {
   const ExprNode n = nodes[t];   // copy: recursive calls may intern nodes and grow the table
-  if (n.loose_bvar_range <= p) { if (lbr_out) *lbr_out = n.loose_bvar_range; if (flags_out) *flags_out = n.flags; return n.hash; }
+  // Bit 7 of the reported flags (never stored in a node) says that the materialisation contains
+  // a temporary term, and so cannot be equal to anything in the permanent tier.
+  const u8 tmp_t = (frozen && t >= wm_nodes) ? 0x80 : 0;
+  if (n.loose_bvar_range <= p) { if (lbr_out) *lbr_out = n.loose_bvar_range; if (flags_out) *flags_out = n.flags | tmp_t; return n.hash; }
   u32 m = (u32)envs[env].size();
   switch (n.kind) {
     case EKind::BVar: {
       u32 i = n.a;
-      if (i - p < m) { const ExprNode& en = nodes[envs[env][i - p]]; if (lbr_out) *lbr_out = 0; if (flags_out) *flags_out = en.flags; return en.hash; }
+      if (i - p < m) {
+        Expr ent = envs[env][i - p];
+        const ExprNode& en = nodes[ent];
+        if (lbr_out) *lbr_out = 0;
+        if (flags_out) *flags_out = en.flags | ((frozen && ent >= wm_nodes) ? 0x80 : 0);
+        return en.hash;
+      }
       if (lbr_out) *lbr_out = i - m + 1; if (flags_out) *flags_out = 0; return hk(EKind::BVar, i - m);
     }
-    case EKind::Clos: { Expr c = mk_clos(t, env, p); if (lbr_out) *lbr_out = nodes[c].loose_bvar_range; if (flags_out) *flags_out = nodes[c].flags; return nodes[c].hash; }
+    case EKind::Clos: {
+      Expr c = mk_clos(t, env, p);
+      if (lbr_out) *lbr_out = nodes[c].loose_bvar_range;
+      if (flags_out) *flags_out = nodes[c].flags | ((frozen && c >= wm_nodes) ? 0x80 : 0);
+      return nodes[c].hash;
+    }
     default: break;
   }
   u64 k = mix(mix(t, p), env ^ (g_memo_gen << 32));
@@ -199,7 +292,7 @@ u64 ExprTable::sem_hash(Expr t, u32 env, u32 p, u32* lbr_out, u8* flags_out) {
       h = hk(EKind::Let, mix(mix(sem_hash(n.a, env, p, &l1, &f1), sem_hash(n.b, env, p, &l2, &f2)), sem_hash(n.c, env, p + 1, &l3, &f3)));
       l = std::max({l1, l2, l3 > 0 ? l3 - 1 : 0}); f = f1 | f2 | f3; break;
     case EKind::Proj: h = hk(EKind::Proj, mix(mix((*g_names)[n.name].hash, n.a), sem_hash(n.b, env, p, &l1, &f1))); l = l1; f = f1; break;
-    default: h = n.hash; l = n.loose_bvar_range; f = n.flags; break;
+    default: h = n.hash; l = n.loose_bvar_range; f = n.flags | tmp_t; break;
   }
   g_hmemo.key[slot] = k; g_hmemo.val[slot] = h; g_hmemo.lbr[slot] = l; g_hmemo.fl[slot] = f;
   if (lbr_out) *lbr_out = l; if (flags_out) *flags_out = f;
@@ -441,14 +534,15 @@ static bool all_closed(size_t n, const Expr* subst) {
 }
 // With closed entries the substitution is suspended in a Clos node: O(1) now, and later
 // paid only for the parts of the term that are actually looked at.
+static const bool g_lazy_subst = !getenv("LL_LAZY") || atoi(getenv("LL_LAZY")) != 0;   // LL_LAZY=0: always substitute eagerly
 Expr instantiate(Expr e, size_t n, const Expr* subst) {
   if (n == 0 || !has_loose_bvars(e)) return e;
-  if (!g_exprs->frozen || !all_closed(n, subst)) return instantiate_eager(e, n, subst);
+  if (!g_lazy_subst || !g_exprs->frozen || !all_closed(n, subst)) return instantiate_eager(e, n, subst);
   return mk_clos(e, g_exprs->mk_env(subst, n, false), 0);
 }
 Expr instantiate_rev(Expr e, size_t n, const Expr* subst) {
   if (n == 0 || !has_loose_bvars(e)) return e;
-  if (!g_exprs->frozen || !all_closed(n, subst)) return instantiate_rev_eager(e, n, subst);
+  if (!g_lazy_subst || !g_exprs->frozen || !all_closed(n, subst)) return instantiate_rev_eager(e, n, subst);
   return mk_clos(e, g_exprs->mk_env(subst, n, true), 0);
 }
 
@@ -473,24 +567,56 @@ Expr abstract_fvars(Expr e, size_t n, const Expr* fvars) {
   });
 }
 
-Expr instantiate_lparams(Expr e, const std::vector<Name>& ps, const std::vector<Level>& ls) {
-  if (ps.empty()) return e;
-  std::unordered_map<Expr, Expr> cache;
-  std::function<Expr(Expr)> go = [&](Expr x) -> Expr {
-    auto it = cache.find(x); if (it != cache.end()) return it->second;
+// A reusable map Expr -> Expr for one instantiation at a time: open addressing with generation
+// stamps, so starting a new instantiation costs nothing and nothing is allocated per entry.
+namespace {
+struct FlatMemo {
+  std::vector<Expr> key, val; std::vector<u32> stamp; u32 gen = 0; size_t used = 0;
+  void begin() {
+    if (key.empty()) { key.assign(1024, 0); val.assign(1024, 0); stamp.assign(1024, 0); }
+    if (++gen == 0) { std::fill(stamp.begin(), stamp.end(), 0); gen = 1; }
+    used = 0;
+  }
+  bool get(Expr k, Expr& v) const {
+    size_t mask = key.size() - 1, i = (size_t)mix(k, 0x51) & mask;
+    while (stamp[i] == gen) { if (key[i] == k) { v = val[i]; return true; } i = (i + 1) & mask; }
+    return false;
+  }
+  void put(Expr k, Expr v) {
+    if ((used + 1) * 2 > key.size()) grow();
+    size_t mask = key.size() - 1, i = (size_t)mix(k, 0x51) & mask;
+    while (stamp[i] == gen) { if (key[i] == k) { val[i] = v; return; } i = (i + 1) & mask; }
+    stamp[i] = gen; key[i] = k; val[i] = v; used++;
+  }
+  void grow() {
+    std::vector<Expr> k2, v2; std::vector<u32> s2;
+    size_t n = key.size() * 2;
+    k2.assign(n, 0); v2.assign(n, 0); s2.assign(n, 0);
+    for (size_t j = 0; j < key.size(); j++) if (stamp[j] == gen) {
+      size_t i = (size_t)mix(key[j], 0x51) & (n - 1);
+      while (s2[i] == gen) i = (i + 1) & (n - 1);
+      s2[i] = gen; k2[i] = key[j]; v2[i] = val[j];
+    }
+    key.swap(k2); val.swap(v2); stamp.swap(s2);
+  }
+};
+struct LParamInst {
+  const std::vector<Name>& ps; const std::vector<Level>& ls; FlatMemo& memo;
+  Expr go(Expr x) {
+    if (!has_lparam(x)) return x;   // nothing below here mentions a universe parameter
+    Expr r;
+    if (memo.get(x, r)) return r;
     Expr self = is_clos(x) ? g_exprs->expose(x) : x;
-    const ExprNode n = ex(x);   // copy, see replace_rec
-    Expr r = self;
+    const ExprNode n = ex(x);   // copy: interning below may grow the node table
+    r = self;
     switch (n.kind) {
       case EKind::Sort: r = mk_sort(instantiate_level_params(n.a, ps, ls)); break;
       case EKind::Const: {
         const std::vector<Level> lst = g_levels->list(n.lvls);
-        if (!lst.empty()) {
-          std::vector<Level> nl; nl.reserve(lst.size());
-          bool ch = false;
-          for (Level l : lst) { Level l2 = instantiate_level_params(l, ps, ls); ch |= (l2 != l); nl.push_back(l2); }
-          if (ch) r = mk_const(n.name, g_levels->mk_list(nl));
-        }
+        std::vector<Level> nl; nl.reserve(lst.size());
+        bool ch = false;
+        for (Level l : lst) { Level l2 = instantiate_level_params(l, ps, ls); ch |= (l2 != l); nl.push_back(l2); }
+        if (ch) r = mk_const(n.name, g_levels->mk_list(nl));
         break;
       }
       case EKind::App: { Expr a = go(n.a), b = go(n.b); r = (a == n.a && b == n.b) ? self : mk_app(a, b); break; }
@@ -502,10 +628,31 @@ Expr instantiate_lparams(Expr e, const std::vector<Name>& ps, const std::vector<
       case EKind::Proj: { Expr b = go(n.b); r = (b == n.b) ? self : mk_proj(n.name, n.a, b); break; }
       default: break;
     }
-    cache.emplace(x, r);
+    memo.put(x, r);
     return r;
-  };
-  return go(e);
+  }
+};
+thread_local FlatMemo g_lparam_memo;
+unsigned g_lparam_depth = 0;
+}
+
+Expr instantiate_lparams(Expr e, const std::vector<Name>& ps, const std::vector<Level>& ls) {
+  if (ps.empty() || !has_lparam(e)) return e;
+  // Instantiating a declaration's parameters by themselves changes nothing.
+  if (ps.size() == ls.size()) {
+    bool same = true;
+    for (size_t i = 0; i < ps.size() && same; i++) same = ls[i] == mk_param(ps[i]);
+    if (same) return e;
+  }
+  // Level instantiation can re-enter itself through an equality test while interning; the
+  // shared memo serves only the outermost call, and a nested one gets a memo of its own.
+  if (g_lparam_depth > 0) { FlatMemo m; m.begin(); LParamInst in{ps, ls, m}; return in.go(e); }
+  g_lparam_depth++;
+  g_lparam_memo.begin();
+  LParamInst in{ps, ls, g_lparam_memo};
+  Expr r = in.go(e);
+  g_lparam_depth--;
+  return r;
 }
 
 Expr head_beta(Expr e) {

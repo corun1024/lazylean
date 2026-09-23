@@ -40,7 +40,10 @@ LevelList LevelTable::mk_list(const std::vector<Level>& ls) {
   lists.push_back(ls);
   u32 cand = (u32)lists.size() - 1;
   u32 r = ltable->intern(cand);
-  if (r != cand) lists.pop_back();
+  if (r != cand) { lists.pop_back(); return r; }
+  if (list_param.size() <= cand) list_param.resize(cand + 1, 0);
+  u8 hp = 0; for (Level l : ls) if (nodes[l].has_param) { hp = 1; break; }
+  list_param[cand] = hp;
   return r;
 }
 

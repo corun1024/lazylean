@@ -3,6 +3,11 @@
 #include <fstream>
 #include <iostream>
 #include <cstring>
+#include <cstdlib>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace ll {
 
@@ -43,6 +48,119 @@ struct Loader {
     c.lparams = nms(o.at("levelParams"));
     c.type = ex_(o.at("type"));
   }
+
+
+  // ---- fast path --------------------------------------------------------------------------
+  // lean4export writes a handful of line shapes with sorted keys and no whitespace, and nearly
+  // every line is one of them.  They are recognised byte by byte here, with no allocation;
+  // anything that does not match exactly (an escape in a string, an unexpected key, a
+  // declaration) goes through the general JSON reader instead, so the fast path can only
+  // decline a line, never misread one.
+  struct Cur {
+    const char* p; const char* e;
+    template <size_t N> bool lit(const char (&s)[N]) {
+      constexpr size_t n = N - 1;
+      if ((size_t)(e - p) < n || memcmp(p, s, n) != 0) return false;
+      p += n; return true;
+    }
+    bool num(u64& v) {
+      if (p >= e || *p < '0' || *p > '9') return false;
+      u64 x = 0;
+      while (p < e && *p >= '0' && *p <= '9') { x = x * 10 + (u64)(*p - '0'); p++; }
+      v = x; return true;
+    }
+    bool at_end() const { return p == e; }
+  };
+  bool binfo_fast(Cur& c, BInfo& bi) {
+    if (c.lit("default\"")) { bi = BInfo::Default; return true; }
+    if (c.lit("implicit\"")) { bi = BInfo::Implicit; return true; }
+    if (c.lit("instImplicit\"")) { bi = BInfo::InstImplicit; return true; }
+    if (c.lit("strictImplicit\"")) { bi = BInfo::StrictImplicit; return true; }
+    return false;
+  }
+  Expr exi(u64 i) { if (i >= exprs.size()) fail("expr index out of range"); return exprs[i]; }
+  Name nmi(u64 i) { if (i >= names.size()) fail("name index out of range"); return names[i]; }
+  Level lvi(u64 i) { if (i >= levels.size()) fail("level index out of range"); return levels[i]; }
+  void put_expr(u64 idx, Expr e) { set_at(exprs, idx, e); out.nexprs++; }
+
+  bool fast(const char* b, const char* e) {
+    Cur c{b, e};
+    u64 n, a, f, t, bd, nm_;
+    BInfo bi;
+    if (c.lit("{\"app\":{\"arg\":")) {
+      if (c.num(a) && c.lit(",\"fn\":") && c.num(f) && c.lit("},\"ie\":") && c.num(n) && c.lit("}") && c.at_end()) {
+        put_expr(n, mk_app(exi(f), exi(a))); return true;
+      }
+      return false;
+    }
+    if (c.lit("{\"ie\":")) {
+      if (!c.num(n)) return false;
+      if (c.lit(",\"lam\":{\"binderInfo\":\"")) {
+        if (binfo_fast(c, bi) && c.lit(",\"body\":") && c.num(bd) && c.lit(",\"name\":") && c.num(nm_) &&
+            c.lit(",\"type\":") && c.num(t) && c.lit("}}") && c.at_end()) {
+          put_expr(n, mk_lam(nmi(nm_), exi(t), exi(bd), bi)); return true;
+        }
+        return false;
+      }
+      if (c.lit(",\"sort\":")) {
+        if (c.num(a) && c.lit("}") && c.at_end()) { put_expr(n, mk_sort(lvi(a))); return true; }
+        return false;
+      }
+      return false;
+    }
+    if (c.lit("{\"forallE\":{\"binderInfo\":\"")) {
+      if (binfo_fast(c, bi) && c.lit(",\"body\":") && c.num(bd) && c.lit(",\"name\":") && c.num(nm_) &&
+          c.lit(",\"type\":") && c.num(t) && c.lit("},\"ie\":") && c.num(n) && c.lit("}") && c.at_end()) {
+        put_expr(n, mk_pi(nmi(nm_), exi(t), exi(bd), bi)); return true;
+      }
+      return false;
+    }
+    if (c.lit("{\"const\":{\"name\":")) {
+      if (!c.num(nm_) || !c.lit(",\"us\":[")) return false;
+      lv_scratch.clear();
+      if (!c.lit("]")) {
+        while (true) {
+          if (!c.num(a)) return false;
+          lv_scratch.push_back(lvi(a));
+          if (c.lit(",")) continue;
+          if (c.lit("]")) break;
+          return false;
+        }
+      }
+      if (c.lit("},\"ie\":") && c.num(n) && c.lit("}") && c.at_end()) {
+        put_expr(n, mk_const(nmi(nm_), g_levels->mk_list(lv_scratch))); return true;
+      }
+      return false;
+    }
+    if (c.lit("{\"bvar\":")) {
+      if (c.num(a) && c.lit(",\"ie\":") && c.num(n) && c.lit("}") && c.at_end()) {
+        put_expr(n, mk_bvar((u32)a)); return true;
+      }
+      return false;
+    }
+    if (c.lit("{\"in\":")) {
+      if (!c.num(n)) return false;
+      if (c.lit(",\"str\":{\"pre\":")) {
+        if (!c.num(a) || !c.lit(",\"str\":\"")) return false;
+        const char* s0 = c.p;
+        while (c.p < c.e && *c.p != '"' && *c.p != '\\') c.p++;
+        if (c.p >= c.e || *c.p != '"') return false;   // an escape: let the JSON reader decode it
+        std::string_view sv(s0, (size_t)(c.p - s0));
+        c.p++;
+        if (!c.lit("}}") || !c.at_end()) return false;
+        set_at(names, n, g_names->mk_str(nmi(a), sv)); out.nnames++; return true;
+      }
+      if (c.lit(",\"num\":{\"i\":")) {
+        if (c.num(a) && c.lit(",\"pre\":") && c.num(f) && c.lit("}}") && c.at_end()) {
+          set_at(names, n, g_names->mk_num(nmi(f), a)); out.nnames++; return true;
+        }
+        return false;
+      }
+      return false;
+    }
+    return false;
+  }
+  std::vector<Level> lv_scratch;
 
   void handle(const JVal& o) {
     if (const JVal* v = o.get("in")) {
@@ -139,22 +257,86 @@ struct Loader {
 };
 } // namespace
 
+static ExportFile load_once(const std::string& path, bool verbose, bool bulk);
+
+// lean4export writes every expression exactly once, so the permanent tier is built by appending
+// nodes and indexing them in parallel afterwards.  Should two turn out equal, the file is loaded
+// again with ordinary interning, which is what gives equal terms a single handle.
 ExportFile load_export(const std::string& path, bool verbose) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) fail("cannot open " + path);
+  static const bool no_bulk = getenv("LL_LOAD_SEQUENTIAL") != nullptr;
+  if (!no_bulk) {
+    ExportFile ef = load_once(path, verbose, true);
+    if (g_exprs->build_index(8)) return ef;
+    std::cerr << "note: the export repeats an expression; loading it again with ordinary interning\n";
+    g_exprs->reset_permanent();
+  }
+  return load_once(path, verbose, false);
+}
+
+static ExportFile load_once(const std::string& path, bool verbose, bool bulk) {
+  int fd = open(path.c_str(), O_RDONLY);
+  if (fd < 0) fail("cannot open " + path);
+  struct stat stt; if (fstat(fd, &stt) != 0) { close(fd); fail("cannot stat " + path); }
+  size_t sz = (size_t)stt.st_size;
   Loader L;
-  std::string buf;
-  while (std::getline(in, buf)) {
+  if (sz == 0) { close(fd); return std::move(L.out); }
+  const char* base = (const char*)mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
+  close(fd);
+  if (base == MAP_FAILED) fail("cannot map " + path);
+  madvise((void*)base, sz, MADV_SEQUENTIAL);
+  const char* end = base + sz;
+  // Size the tables once, from the line count: nearly every line of an export is an expression,
+  // and growing an intern table of tens of millions of entries rehashes all of them each time.
+  // An export line is rarely under 30 bytes, so this bounds the number of expressions from above
+  // without reading the file twice.  Only address space is reserved: pages are touched as they
+  // fill, and the permanent hash table is sized exactly, from the node count, when it is built.
+  size_t lines = sz / 30 + 1024;
+  g_exprs->reserve_permanent(lines, !bulk);
+  g_exprs->bulk = bulk;
+  g_names->reserve(lines / 40);
+  L.exprs.reserve(lines);
+  advise_huge(L.exprs.data(), lines * sizeof(Expr));
+  L.names.reserve(lines / 8);
+  static const bool no_fast = getenv("LL_LOAD_SLOW") != nullptr;   // testing: force the JSON reader
+  // The mapped file would otherwise stay resident for the whole load (gigabytes for Mathlib), on
+  // top of what the load builds; pages already read are handed back as the cursor moves on.
+  const size_t page = (size_t)sysconf(_SC_PAGESIZE), window = (size_t)64 << 20;
+  const char* released = base;
+  for (const char* q = base; q < end; ) {
+    if ((size_t)(q - released) > window) {
+      const char* upto = base + (((size_t)(q - base)) / page) * page;
+      madvise((void*)released, (size_t)(upto - released), MADV_DONTNEED);
+      released = upto;
+    }
+    const char* nl = (const char*)memchr(q, '\n', (size_t)(end - q));
+    const char* le = nl ? nl : end;
     L.line++;
-    if (buf.empty()) continue;
+    const char* lb = q;
+    const char* lx = le;
+    if (lx > lb && lx[-1] == '\r') lx--;
+    q = nl ? nl + 1 : end;
+    if (lx == lb) continue;
     try {
-      JParser p(buf.data(), buf.data() + buf.size());
-      JVal v = p.parse();
-      L.handle(v);
+      if (no_fast || !L.fast(lb, lx)) {
+        JParser pz(lb, lx);
+        JVal v = pz.parse();
+        L.handle(v);
+      }
     } catch (KernelError& e) {
+      munmap((void*)base, sz);
       fail("line " + std::to_string(L.line) + ": " + e.what());
     }
     if (verbose && L.line % 1000000 == 0) std::cerr << "  ... " << L.line << " lines\n";
+  }
+  munmap((void*)base, sz);
+  if (getenv("LL_LOAD_CHECKSUM")) {
+    // testing: a digest of everything the load produced, in index order, to compare loaders
+    u64 h = 0x9E3779B97F4A7C15ull;
+    for (Expr e : L.exprs) h = mix(h, e == NIL ? 0 : raw(e).hash);
+    for (Name n : L.names) h = mix(h, n == NIL ? 0 : (*g_names)[n].hash);
+    for (Level l : L.levels) h = mix(h, l);
+    std::cerr << "load checksum " << std::hex << h << std::dec << " exprs " << L.exprs.size()
+              << " names " << L.names.size() << " levels " << L.levels.size() << "\n";
   }
   return std::move(L.out);
 }

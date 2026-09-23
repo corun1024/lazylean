@@ -23,7 +23,7 @@ namespace ll {
 // `cache` persists for a declaration: a term's fused form is a function of the term and the
 // environment, so equal terms fuse to equal terms wherever they occur (results cut short by a
 // size or depth limit are not cached, as they depend on the context).
-Expr fuse_term(const Environment& env, std::unordered_map<Expr, Expr>& cache, Expr e);
+Expr fuse_term(const Environment& env, FlatMap<Expr>& cache, Expr e);
 
 bool is_nat_prim(Name f);   // a Nat primitive the machine computes with GMP: never unfolded, never given a fixpoint rule
 // Fusion and fixpoint rules cost a tree walk and a verification per definition, and only repay
@@ -31,6 +31,8 @@ bool is_nat_prim(Name f);   // a Nat primitive the machine computes with GMP: ne
 // once or twice, so both are held back until a constant has been unfolded often enough to be
 // worth it.  The count is global and monotone, and the decision for one declaration is frozen by
 // the per-declaration unfold cache, so a term keeps one shape while it is being checked.
+bool is_recursion_wrapper(const ConstInfo& c);   // brecOn / casesOn / matcher / _f: compiled recursion
+extern u64 g_decl_wrap;   // unfoldings of such wrappers in the current attempt
 unsigned bump_unfolds(Name n);       // count this unfold, return the new count
 unsigned unfold_count(Name n);
 extern unsigned g_fuse_min, g_fix_min;

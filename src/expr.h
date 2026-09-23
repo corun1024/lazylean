@@ -14,7 +14,7 @@ enum class LitKind : u8 { Nat = 0, Str = 1 };
 struct ExprNode {
   EKind kind;
   BInfo binfo;
-  u8 flags;            // bit0: has_fvar
+  u8 flags;            // bit0: has_fvar, bit1: mentions a universe parameter
   u32 loose_bvar_range;
   u32 a, b, c;         // children / payload (see mk_* below)
   u32 name;            // binder name, const name, proj struct name
@@ -60,6 +60,14 @@ struct ExprTable {
   // Two-tier interning: nodes created before `freeze()` are permanent (the loaded export);
   // nodes created afterwards live in a temporary table that `reclaim()` drops, truncating the
   // node table back to the watermark.  Callers must not keep temporary handles across reclaim().
+  void reserve_permanent(size_t nexprs, bool size_table = true);   // size the permanent tier for a load of about this many nodes
+  // Bulk loading: while `bulk` is set, nodes are appended without being looked up (the export
+  // writes each expression once); build_index() then fills the permanent table from several
+  // threads.  It returns false if two appended nodes turned out equal, in which case the load
+  // has to be redone with ordinary interning.
+  bool bulk = false;
+  bool build_index(unsigned threads);
+  void reset_permanent();
   void freeze();
   void reclaim();
   void trim();   // after reclaim: return the temporary tier's capacity to the allocator (after a blow-up)
@@ -89,6 +97,7 @@ private:
   InternTable<SH, SE>* stable; InternTable<SH, SE>* tstable;
 };
 extern ExprTable* g_exprs;
+extern u64 g_int_perm_probe, g_int_perm_hit, g_int_temp_hit, g_int_new, g_int_kind[16];   // intern statistics
 extern u64 g_cnt_clos, g_cnt_clos_compose, g_cnt_clos_expand, g_cnt_expose, g_cnt_env;
 // `ex` looks through closure nodes: a Clos handle presents the node of its exposed form, so
 // kind() and the field accessors below see ordinary structure.  Flags and the loose-bvar
@@ -98,6 +107,7 @@ inline const ExprNode& raw(Expr e) { return g_exprs->raw(e); }
 inline EKind kind(Expr e) { return ex(e).kind; }
 inline bool is_clos(Expr e) { return raw(e).kind == EKind::Clos; }
 inline bool has_fvar(Expr e) { return raw(e).flags & 1; }
+inline bool has_lparam(Expr e) { return raw(e).flags & 2; }
 inline bool has_loose_bvars(Expr e) { return raw(e).loose_bvar_range > 0; }
 inline u32 loose_bvar_range(Expr e) { return raw(e).loose_bvar_range; }
 

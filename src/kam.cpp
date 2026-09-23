@@ -633,7 +633,9 @@ struct MachineRun {
           }
         }
         if (delta && c->is_delta() && g_levels->list_size(const_levels(h)) == c->lparams.size()) {
-          g_k_delta++; M.steps++; if (g_hist) g_delta_hist[n]++; h = M.unfold_body(h); env = Ref<Env>(); return false;
+          g_k_delta++; M.steps++; if (g_hist) g_delta_hist[n]++;
+          if (is_recursion_wrapper(*c)) count_wrapper();
+          h = M.unfold_body(h); env = Ref<Env>(); return false;
         }
         return true;
       }

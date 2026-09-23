@@ -1,9 +1,23 @@
 #include "name.h"
+#include <sys/mman.h>
+#include <cstdint>
+#include <cstdlib>
 
 namespace ll {
 
 NameTable* g_names = nullptr;
+
+void advise_huge(void* p, size_t bytes) {
+  static const bool off = getenv("LL_NO_HUGEPAGES") != nullptr;
+  const size_t huge = (size_t)2 << 20;
+  if (off || bytes < 4 * huge || !p) return;
+  uintptr_t b = ((uintptr_t)p + huge - 1) & ~(uintptr_t)(huge - 1);
+  uintptr_t e = ((uintptr_t)p + bytes) & ~(uintptr_t)(huge - 1);
+  if (e > b) madvise((void*)b, e - b, MADV_HUGEPAGE);
+}
 Names N;
+
+void NameTable::reserve(size_t n) { nodes.reserve(n + 1024); table->reserve(n); }
 
 NameTable::NameTable() {
   nodes.push_back(NameNode{0, true, 0, "", 0});  // anonymous

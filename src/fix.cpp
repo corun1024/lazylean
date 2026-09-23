@@ -99,7 +99,7 @@ bool reject(const ConstInfo& c, int where) { if (g_fix_trace) std::cerr << "[fix
 
 bool derive(const Environment& env, const ConstInfo& c, FixRule& out) {
   if (c.kind != CKind::Def || c.safety != Safety::Safe || c.value == NIL || c.hint == HintKind::Opaque || is_nat_prim(c.name)) return reject(c, 1);
-  std::unordered_map<Expr, Expr> fcache;
+  FlatMap<Expr> fcache;
   Expr B0 = fuse_term(env, fcache, c.value);
   // lambda prefix x_1 .. x_n
   std::vector<Expr> doms; std::vector<Name> names; std::vector<BInfo> bis;

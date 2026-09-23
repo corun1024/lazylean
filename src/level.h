@@ -17,6 +17,7 @@ struct LevelNode {
 struct LevelTable {
   std::vector<LevelNode> nodes;
   std::vector<std::vector<Level>> lists;  // interned level lists; lists[0] = {}
+  std::vector<u8> list_param;             // lists[i] mentions a universe parameter
   LevelTable();
   const LevelNode& operator[](Level l) const { return nodes[l]; }
   Level mk_succ(Level a);
@@ -26,6 +27,8 @@ struct LevelTable {
   LevelList mk_list(const std::vector<Level>& ls);
   std::vector<Level> list(LevelList i) const { return lists[i]; }  // by value: `lists` may reallocate
   size_t list_size(LevelList i) const { return lists[i].size(); }
+  bool list_has_param(LevelList i) const { return i < list_param.size() && list_param[i]; }
+  const std::vector<Level>& list_ref(LevelList i) const { return lists[i]; }   // valid until the next mk_list
 private:
   Level intern(LevelNode nd);
   struct H { LevelTable* t; u64 operator()(u32 h) const { return t->nodes[h].hash; } };

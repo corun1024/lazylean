@@ -15,6 +15,7 @@ struct NameNode {
 struct NameTable {
   std::vector<NameNode> nodes;
   NameTable();
+  void reserve(size_t n);   // size for a load of about n names
   Name mk_str(Name parent, std::string_view s);
   Name mk_num(Name parent, u64 n);
   const NameNode& operator[](Name n) const { return nodes[n]; }

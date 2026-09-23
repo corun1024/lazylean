@@ -17,6 +17,19 @@ unsigned bump_unfolds(Name n) {
   return ++g_unfolds[n];
 }
 unsigned unfold_count(Name n) { return n < g_unfolds.size() ? g_unfolds[n] : 0; }
+u64 g_decl_wrap = 0;
+static std::vector<u8> g_wrapper_of;   // Name -> 0 unknown, 1 wrapper, 2 not
+bool is_recursion_wrapper(const ConstInfo& c) {
+  if (c.name < g_wrapper_of.size() && g_wrapper_of[c.name]) return g_wrapper_of[c.name] == 1;
+  const NameNode& nn = (*g_names)[c.name];
+  std::string_view last = nn.is_str ? std::string_view(nn.str) : std::string_view();
+  bool w = last == "casesOn" || last == "recOn" || last == "brecOn" || last == "binductionOn" || last == "_f" ||
+           last.substr(0, 6) == "match_" || last.substr(0, 14) == "_sparseCasesOn";
+  if (!w && last == "go" && nn.parent) { const NameNode& q = (*g_names)[nn.parent]; w = q.is_str && q.str == "brecOn"; }
+  if (c.name >= g_wrapper_of.size()) g_wrapper_of.resize(std::max<size_t>(c.name + 1, g_wrapper_of.size() * 2 + 1024), 0);
+  g_wrapper_of[c.name] = w ? 1 : 2;
+  return w;
+}
 static int g_fuse_iota = getenv("LL_FUSE_IOTA") ? atoi(getenv("LL_FUSE_IOTA")) : 1;
 static int g_fuse_reg = getenv("LL_FUSE_REG") ? atoi(getenv("LL_FUSE_REG")) : 0;   // inlining regular definitions at call sites is not canonical: off by default
 static int g_fuse_lamcheap = getenv("LL_FUSE_LAMCHEAP") ? atoi(getenv("LL_FUSE_LAMCHEAP")) : 1;
@@ -143,14 +156,14 @@ void count_bvars(Expr b, size_t n, std::vector<u8>& cnt) {
 
 struct Fuser {
   const Environment& env;
-  std::unordered_map<Expr, Expr>& cache;   // persistent (per declaration): results computed without hitting a limit
-  std::unordered_map<Expr, Expr> memo;     // this call's results, limits or not
+  FlatMap<Expr>& cache;   // persistent (per declaration): results computed without hitting a limit
+  FlatMap<Expr> memo;     // this call's results, limits or not
   size_t budget;
   unsigned depth = 0;
   bool overflow = false;
   u64 dirty = 0;   // bumped whenever a limit cuts a reduction short: such results depend on the context
   size_t dup_budget = 1u << 15;   // tree nodes that may still be duplicated by substitutions
-  Fuser(const Environment& e, std::unordered_map<Expr, Expr>& c, size_t b) : env(e), cache(c), budget(b) {}
+  Fuser(const Environment& e, FlatMap<Expr>& c, size_t b) : env(e), cache(c), budget(b) {}
 
   static Expr ctor_app_field(const Environment& env, Expr s, Name sname, u32 idx) {
     std::vector<Expr> args; Expr h = get_app_args_fn(s, args);
@@ -302,7 +315,7 @@ struct Fuser {
 
 } // namespace
 
-Expr fuse_term(const Environment& env, std::unordered_map<Expr, Expr>& cache, Expr e) {
+Expr fuse_term(const Environment& env, FlatMap<Expr>& cache, Expr e) {
   auto it = cache.find(e);
   if (it != cache.end()) return it->second;
   g_fuse_bodies++;
