@@ -14,8 +14,9 @@ Krivine machine with call-by-need thunks, after Coq's `cClosure`. That checker's
 final, so the evaluator only ever has to be right when it accepts.
 
 On the Lean Kernel Arena's ranking measure, the instructions executed to check all of Mathlib,
-lazylean 0.4.1 needs 0.46 × 10¹² instructions for 654 504 declarations, on one core, in under
-four minutes: a third less than the fastest checker of the 2026-09 round and twelve times less
+lazylean 0.4.2 needs 0.52 × 10¹² instructions for 654 504 declarations, on one core, in about
+three minutes, and at most 4.8 GB of memory: a quarter fewer instructions than the fastest
+checker of the 2026-09 round, less memory than any of them, and eleven times fewer instructions
 than lazylean 0.3.0. On the Four Colour Theorem's 201 672-declaration dependency closure the
 lazy machine needs 3.9 core-hours where Lean's kernel needs 7.5, and where Lean's kernel dies at
 178 GB on a raw port of Gonthier's reducibility check, it finishes in 21 GB.
@@ -89,8 +90,8 @@ computed once), so a subterm's value is shared by every context that agrees on i
 variables. Measured on Std, pruning turned 41% of evaluation misses into hits.
 
 **Sessions.** Values live in a bump arena, and the arena and every cache last for a *session*
-of about 1.5 GB of values -- tens of thousands of declarations -- rather than for one
-declaration. The environment only grows and a value means the same thing wherever it is used, so
+of values -- 128 MB for Mathlib, less for smaller exports, thousands of declarations -- rather
+than for one declaration. The environment only grows and a value means the same thing wherever it is used, so
 a constant's type, an instance's unfolding or a conversion already decided is paid for once per
 session. The caches are open-addressing tables whose memory is mapped once, 2 MB-aligned and
 pre-faulted, and reused across sessions, so the kernel's page-fault work is paid once too.
@@ -104,8 +105,8 @@ not be compared once the arguments before them agree) and whether an application
 all (then proof irrelevance needs no type inference).
 
 **Only when it pays, and never as the last word.** A declaration that takes more than a million
-evaluation steps is declined and checked by the lazy machine, which is the better engine for
-computation. Inductive types and quotients always go to the reference checker. Any failure in
+evaluation steps, or allocates more than 64 MB of values, is declined and checked by the lazy
+machine, which is the better engine for computation and frugal with memory. Inductive types and quotients always go to the reference checker. Any failure in
 the evaluator -- including a genuine type error -- is a decline, and the reference checker then
 gives the verdict.
 
@@ -329,26 +330,46 @@ end.
 
 ## Performance
 
-### Version 0.4: instructions, the arena's measure
+### Version 0.4: instructions, the arena's measure, and memory
 
 The Lean Kernel Arena ranks checkers first by their verdicts and then by the number of
 instructions (`perf stat -e instructions`, summed over every thread and process) they execute
 on the Mathlib export; its time columns are that count divided by 6 × 10⁹. Wall clock does not
-enter the ranking, and neither does the number of cores, which is why 0.4.0 runs as a single
+enter the ranking, and neither does the number of cores, which is why 0.4 runs as a single
 process. Billions of instructions, all declarations accepted in every run:
 
-| corpus | declarations | lazylean 0.3.0 | mathgraph | sokonanoda | nanoclo | Lean's kernel | lazylean 0.4.1 |
-|---|---|---|---|---|---|---|---|
-| Init | 53 093 | 213 | 37 | 39 | 121 | 367 | **21** |
-| Std | 90 778 | 351 | 62 | 65 | 201 | 617 | **36** |
-| con-leche | 26 819 | 457 | 157 | 162 | 315 | 665 | **75** |
-| CSLib | 370 939 | 1 248 | 237 | 249 | 775 | 2 428 | **141** |
-| Mathlib | 654 504 | 5 529 | 709 | 745 | 3 064 | 11 832 | **464** |
+| corpus | declarations | lazylean 0.3.0 | mathgraph | sokonanoda | nanoclo | Lean's kernel | lazylean 0.4.1 | lazylean 0.4.2 |
+|---|---|---|---|---|---|---|---|---|
+| Init | 53 093 | 213 | 37 | 39 | 121 | 367 | 21 | **27** |
+| Std | 90 778 | 351 | 62 | 65 | 201 | 617 | 36 | **47** |
+| con-leche | 26 819 | 457 | 157 | 162 | 315 | 665 | 75 | **108** |
+| CSLib | 370 939 | 1 248 | 237 | 249 | 775 | 2 428 | 141 | **174** |
+| Mathlib | 654 504 | 5 529 | 709 | 745 | 3 064 | 11 832 | 464 | **519** |
 
-The other columns are the arena's own figures from round 2026-09; lazylean 0.4.1 was measured
-the same way (`perf stat -e instructions`, single process, `-k`) on a 64-core AMD EPYC 7B13 VM.
-On Mathlib that is 77 s of the arena's virtual time against 118 s for the round's fastest
-checker; the real run takes 198 s of wall clock on one core and peaks at 11.2 GB.
+Peak memory (resident set, GB, as the arena measures it with GNU `time`):
+
+| corpus | lowest other checker in 2026-09 | mathgraph | sokonanoda | Lean's kernel | lazylean 0.4.1 | lazylean 0.4.2 |
+|---|---|---|---|---|---|---|
+| Init | 0.43 (still-nanoda) | 0.60 | 0.72 | 0.56 | 4.0 | **0.39** |
+| Std | 0.68 (still-nanoda) | 0.92 | 1.06 | 0.92 | 4.9 | **0.64** |
+| con-leche | 0.75 (still-nanoda) | 3.55 | 4.49 | 0.90 | 5.7 | **0.70** |
+| CSLib | 2.43 (still-nanoda) | 2.87 | 3.07 | 3.31 | 7.3 | **1.93** |
+| Mathlib | 5.61 (still-nanoda) | 6.07 | 6.36 | 8.16 | 11.2 | **4.77** |
+
+The other columns are the arena's own figures from round 2026-09; lazylean was measured the
+same way (`perf stat -e instructions`, GNU `time`, single process, `-k`) on 64-core AMD EPYC
+VMs. 0.4.2 trades a little of 0.4.1's speed for memory: on Mathlib 87 s of the arena's virtual
+time against 118 s for the round's fastest checker, 184 s of wall clock on one core, and 4.77 GB
+at the peak against 11.2.
+
+Where the memory went in 0.4.2, on Mathlib: expression nodes shrink from 40 to 32 bytes (a
+32-bit hash), and the permanent intern index stores 4-byte handles rather than 8-byte
+tag-and-handle slots (together −1.3 GB); the loose-variable masks the evaluation engine keys its
+caches with live in node fields that only constants and lets otherwise use, instead of a
+separate array (−0.36 GB); sessions shrink to 128 MB of values with tables allowed to fill to
+three quarters and trimmed after a large session (−5 GB); declarations that compute are handed
+to the lazy machine once they allocate 64 MB (they had been the peak); and the export's copy of
+each constant is released once the environment has its own, and name strings are pooled.
 
 Where the eleven-fold reduction on Mathlib came from, in the order it was made: the evaluation
 engine itself (5.5 → 0.92 × 10¹²), reusing its memory across sessions instead of returning it
@@ -357,7 +378,7 @@ line in one pass and appends nodes without a lookup, and memoised universe-level
 which had been a fifth of the time on late Mathlib because it compared parameter names through
 heap-allocated vectors (→ 0.58), and walking a function's type as a telescope without building
 the intermediate Π values (→ 0.49), and in 0.4.1 reading the export's numbers eight bytes at a
-time and longer sessions (→ 0.46).
+time and longer sessions (→ 0.46). 0.4.2 gives back some of that for memory (→ 0.52).
 
 
 ### Version 0.3.0 (wall clock)
@@ -549,6 +570,7 @@ GMP is the only dependency (`libgmp-dev`). Exit status 0 means every declaration
 
 ```
 LL_NBE=0 lazylean export.ndjson              the reference checker alone (no evaluation engine)
+LL_MEMREPORT=1 lazylean export.ndjson        report resident memory and the engine's table sizes
 lazylean --from-line L --count N export.ndjson   check N declarations starting at line L
 lazylean -k -v --slow 1 export.ndjson        keep going after a failure, log each declaration,
                                              list the ones slower than 1 s
