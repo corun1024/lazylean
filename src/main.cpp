@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <malloc.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <atomic>
@@ -25,6 +26,18 @@ namespace ll { extern bool g_strict_metadata; }
 void dump_census();
 using namespace ll;
 
+// LL_MEMREPORT: resident and peak memory at points of the run (from /proc/self/status)
+static void mem_report(const char* where) {
+  static const bool on = getenv("LL_MEMREPORT") != nullptr;
+  if (!on) return;
+  FILE* f = fopen("/proc/self/status", "r"); if (!f) return;
+  char line[256]; long rss = 0, hwm = 0;
+  while (fgets(line, sizeof line, f)) { sscanf(line, "VmRSS: %ld", &rss); sscanf(line, "VmHWM: %ld", &hwm); }
+  fclose(f);
+  struct mallinfo2 mi = mallinfo2();
+  std::cerr << "mem " << where << ": rss " << rss / 1024 << " MB, peak " << hwm / 1024 << " MB; malloc in use " << (mi.uordblks >> 20)
+            << " MB (heap " << (mi.arena >> 20) << " MB, mmapped " << (mi.hblkhd >> 20) << " MB, free in heap " << (mi.fordblks >> 20) << " MB)\n";
+}
 static double now() {
   using namespace std::chrono;
   return duration<double>(steady_clock::now().time_since_epoch()).count();
@@ -176,6 +189,8 @@ static int run(const Options& opt) {
   double t0 = now();
   ExportFile ef = load_export(opt.file, opt.verbose);
   double t1 = now();
+  mem_report("after load");
+  { struct stat st; if (stat(opt.file.c_str(), &st) == 0) nbe_size_sessions((size_t)st.st_size); }
   std::cerr << "loaded " << ef.decls.size() << " declarations, " << ef.nexprs << " exprs (" << g_exprs->size()
             << " unique), " << ef.nnames << " names in " << (t1 - t0) << "s\n";
   kam_init();
@@ -271,10 +286,11 @@ static int run(const Options& opt) {
     while (std::getline(tf, line)) if (!line.empty()) trusted.insert(line);
     std::cerr << "trusting " << trusted.size() << " named declarations (added unchecked)\n";
   }
-  for (const Decl& d : ef.decls) {
+  for (Decl& d : ef.decls) {
     // the declaration's name as a string, built only when something needs it
+    const Name dname = d.consts[0].name;
     std::string nm_s; bool nm_ok = false;
-    auto nm = [&]() -> const std::string& { if (!nm_ok) { nm_s = name_str(d.consts[0].name); nm_ok = true; } return nm_s; };
+    auto nm = [&]() -> const std::string& { if (!nm_ok) { nm_s = name_str(dname); nm_ok = true; } return nm_s; };
     bool check = true;
     size_t my_index = di++;
     if (opt.nshards > 1 && (my_index % opt.nshards) != opt.shard) check = false;
@@ -298,7 +314,7 @@ static int run(const Options& opt) {
         size_t mark = env.mark();
         if (g_nbe && nbe_check(env, d)) {
           // accepted by the evaluation engine; anything it declines is checked below
-          env.add(d.consts[0]);
+          env.add(std::move(d.consts[0]));
         } else try {
           if (two_attempts) { g_fuse = 0; g_fix = 0; g_step_budget = fuse_budget; } g_decl_work = 0; g_decl_wrap = 0;
           u64 d0 = g_k_delta, i0 = g_k_iota, s0 = st.steps;
@@ -345,6 +361,14 @@ static int run(const Options& opt) {
     fix_after_reclaim();
     g_lctx.decls.clear();
     nbe_between_decls();
+    // The environment has its own copy of what it needs: the export's is no longer used.
+    std::vector<ConstInfo>().swap(d.consts);
+    { static const bool mr = getenv("LL_MEMREPORT") != nullptr; static long last = 0;
+      if (mr && (ok & 255) == 0) {
+        FILE* f = fopen("/proc/self/status", "r"); char line[256]; long hwm = 0;
+        if (f) { while (fgets(line, sizeof line, f)) sscanf(line, "VmHWM: %ld", &hwm); fclose(f); }
+        if (hwm > last + 51200) { std::cerr << "mem peak " << hwm / 1024 << " MB at declaration " << ok << " " << nm() << "\n"; last = hwm; }
+      } }
     if (dt > opt.slow) slow.emplace_back(dt, nm());
     if (opt.verbose) std::cerr << (check ? "ok   " : "skip ") << nm() << " " << dt << "s\n";
     if (!opt.stop_at.empty() && nm() == opt.stop_at) break;
@@ -355,6 +379,12 @@ static int run(const Options& opt) {
   std::cerr << "checked " << ok << " declarations, " << failed << " failed, " << unchecked << " added unchecked, in "
             << (t2 - t1) << "s; " << st.steps << " reduction steps; " << g_exprs->size() << " exprs live"
             << (g_engine == 2 ? "; engine mismatches: " + std::to_string(g_engine_mismatches) : std::string("")) << "\n";
+  mem_report("end");
+  if (getenv("LL_MEMREPORT")) {
+    size_t ci = 0; for (const ConstInfo& c : env.consts) ci += sizeof(ConstInfo) + (c.lparams.capacity() + c.all.capacity() + c.ctors.capacity()) * 4 + c.rules.capacity() * sizeof(RecRule);
+    size_t di = 0; for (const Decl& d : ef.decls) { di += sizeof(Decl); for (const ConstInfo& c : d.consts) di += sizeof(ConstInfo) + (c.lparams.capacity() + c.all.capacity() + c.ctors.capacity()) * 4 + c.rules.capacity() * sizeof(RecRule); }
+    std::cerr << "env consts " << env.consts.size() << " (" << (ci >> 20) << " MB), export decls " << ef.decls.size() << " (" << (di >> 20) << " MB), names " << g_names->nodes.size() << " x " << sizeof(NameNode) << " B\n";
+  }
   nbe_report();
   std::cerr << "counters: defeq " << g_cnt_defeq << " (quick " << g_cnt_defeq_quick << ", proof-irrel " << g_cnt_pi << ", lazy " << g_cnt_lazy << ", binding " << g_cnt_binding
             << "); infer " << g_cnt_infer << " (hit " << g_cnt_infer_hit << "); whnf " << g_cnt_whnf << " (hit " << g_cnt_whnf_hit << "); whnf_core " << g_cnt_whnfcore << " (hit " << g_cnt_whnfcore_hit << ")\n";

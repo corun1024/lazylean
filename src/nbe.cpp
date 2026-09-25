@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <chrono>
 #include <sys/mman.h>
+#include <malloc.h>
 
 namespace ll {
 
@@ -69,7 +70,7 @@ template <class T, size_t K> struct SVec {   // trivially copyable T
 };
 
 struct Arena {
-  static constexpr size_t BLOCK = (size_t)32 << 20;
+  static constexpr size_t BLOCK = (size_t)16 << 20;
   std::vector<char*> blocks; size_t idx = 0; uintptr_t cur = 0, end = 0;
   std::vector<void*> big; size_t bytes = 0;
   void* alloc(size_t n) {
@@ -85,9 +86,12 @@ struct Arena {
     cur = (uintptr_t)b; end = cur + BLOCK; bytes += BLOCK;
     void* p = (void*)cur; cur += n; return p;
   }
-  void reset() {
+  // Start over, keeping at most `keep` bytes of blocks for reuse: a declaration that needed far
+  // more than a session's budget does not leave its memory resident for the rest of the run.
+  void reset(size_t keep) {
     for (void* p : big) free(p);
     big.clear(); idx = 0; cur = end = 0; bytes = 0;
+    while (blocks.size() > keep / BLOCK + 1) { big_free(blocks.back(), BLOCK); blocks.pop_back(); }
   }
   template <class T> T* make() { return new (alloc(sizeof(T))) T(); }
 };
@@ -126,7 +130,7 @@ template <class V> struct PMap {
     free_tab(old, oc);
   }
   V& put(u64 a, u64 b, V v) {
-    if (!t || (n + 1) * 2 > mask + 1) grow();
+    if (!t || (n + 1) * 4 > (mask + 1) * 3) grow();
     size_t i = hs(a, b) & mask;
     while (true) {
       S& s = t[i];
@@ -138,7 +142,7 @@ template <class V> struct PMap {
   // Find the entry for (a, b), or create it (value zeroed) if absent; `created` says which.
   // The pointer is valid until the next insertion.
   V* slot(u64 a, u64 b, bool& created) {
-    if (!t || (n + 1) * 2 > mask + 1) grow();
+    if (!t || (n + 1) * 4 > (mask + 1) * 3) grow();
     size_t i = hs(a, b) & mask;
     while (true) {
       S& s = t[i];
@@ -150,7 +154,13 @@ template <class V> struct PMap {
   // Empty the map, keeping its table (zeroing is a string store: cheap in instructions).
   void clear() {
     if (!t || !n) return;
-    memset(t, 0, (mask + 1) * sizeof(S)); n = 0;
+    size_t cap = mask + 1;
+    if (cap >= BIG && n * 8 < cap) {   // far larger than this session needed: give memory back
+      size_t nc = BIG; while (n * 2 > nc) nc *= 2;
+      free_tab(t, cap); t = alloc_tab(nc); mask = nc - 1; n = 0; gen++;
+      return;
+    }
+    memset(t, 0, cap * sizeof(S)); n = 0;
   }
   size_t size() const { return n; }
 };
@@ -193,6 +203,8 @@ struct Env { Env* parent; Val* v; LSub* ls; u32 len; u32 frame; u64 mask; u64 pm
 Val g_stuck_obj;
 Val* const STUCK = &g_stuck_obj;
 Val g_unused;
+extern size_t g_session_bytes;
+const size_t g_decl_arena = getenv("LL_NBE_DECL_MB") ? (size_t)atol(getenv("LL_NBE_DECL_MB")) << 20 : (size_t)64 << 20;
 const u64 g_nbe_budget = getenv("LL_NBE_BUDGET") ? strtoull(getenv("LL_NBE_BUDGET"), nullptr, 10) : 1000000;
 u64 s_hist[8] = {0};   // declarations by steps: <1e3, <1e4, .. <1e9, more   // stands for an argument whose variable the term it is bound in never mentions
 
@@ -237,7 +249,7 @@ struct Engine {
   // per declaration
   const std::vector<Name>* lparams = nullptr;
   u32 scope = 1;
-  u64 steps = 0, budget = 0;
+  u64 steps = 0, budget = 0; size_t arena0 = 0;
   u32 depth = 0;
   bool probing = false, exhausted = false; u32 probe_left = 0;
 
@@ -246,16 +258,23 @@ struct Engine {
     explicit Guard(Engine& e) : g(e) { if (++g.depth > 100000) nfail("recursion depth"); }
     ~Guard() { g.depth--; }
   };
-  void tick() { if (++steps > budget) nfail("step budget"); }
+  // A declaration that computes is declined past a step budget or an allocation budget, and the
+  // reference checker's lazy machine -- the better engine for evaluation, and frugal with
+  // memory -- checks it instead.
+  void tick() {
+    if (++steps > budget) nfail("step budget");
+    if (ar.bytes > arena0 + g_decl_arena) nfail("memory budget");
+  }
 
   void start_session() {
-    ar.reset();
+    ar.reset(g_session_bytes);
     c_head.clear(); c_type.clear(); c_unfold.clear(); c_rule.clear(); c_eval.clear(); c_env.clear();
     c_bvar.clear(); c_app.clear(); c_lit.clear(); c_vtype.clear(); c_lvl.clear(); c_lsub.clear();
     c_pos.clear(); c_neg.clear(); c_isprop.clear(); c_infer.clear(); c_frame.clear(); memset(prune_dm, 0, sizeof(PruneDM) << PRUNE_DM_BITS);
     nats.clear(); lsubs.clear();
     groot = ar.make<Env>();
     s_sessions++;
+    malloc_trim(0);   // hand back what earlier declarations freed (the export's copies of constants)
   }
 
   // ---------------------------------------------------------------- levels
@@ -350,9 +369,19 @@ struct Engine {
   }
 
   // ---- pruning
-  u64* fvm = nullptr; size_t fvm_n = 0;   // per permanent term: its loose variables (0: not yet computed)
+  // A permanent term's loose variables, kept in the node's fields that only constants (`lvls`)
+  // and lets (`c`) use: the low half in `lvls`, the high half in `c` for applications, binders
+  // and projections.  Zero: not yet computed (an open term's mask is never zero); all ones:
+  // unknown -- more than 64 variables, or a let with variables past the 32nd -- and then
+  // nothing is pruned.
+  size_t fvm_n = 0;   // the permanent tier
+  static bool wide_kind(EKind k) { return k == EKind::App || k == EKind::Lam || k == EKind::Pi || k == EKind::Proj; }
   inline u64 fv_mask(Expr e) {
-    if (e < fvm_n && fvm[e]) return fvm[e];
+    if (e < fvm_n) {
+      const ExprNode& n = g_nodes[e];
+      if (wide_kind(n.kind)) { u64 m = ((u64)n.c << 32) | n.lvls; if (m) return m; }
+      else if (n.kind == EKind::Let && n.lvls) return n.lvls == ~0u ? ~0ull : n.lvls;
+    }
     return fv_mask_slow(e);
   }
   __attribute__((noinline)) u64 fv_mask_slow(Expr e) {
@@ -371,7 +400,9 @@ struct Engine {
       case EKind::Proj: r = fv_mask(n.b); break;
       default: r = ~0ull;
     }
-    fvm[e] = r;
+    ExprNode& w = const_cast<ExprNode&>(g_nodes[e]);
+    if (wide_kind(n.kind)) { w.lvls = (u32)r; w.c = (u32)(r >> 32); }
+    else if (n.kind == EKind::Let) w.lvls = (r >> 32) ? ~0u : (u32)r;
     return r;
   }
   PMap<Env*> c_frame;
@@ -1396,15 +1427,10 @@ struct Engine {
     if (!groot) start_session();
     E = &env;
     g_nodes = g_exprs->nodes.data();
-    if (!fvm) {   // sized to the permanent tier; pages are touched only for terms actually met
-      fvm_n = g_exprs->wm_nodes ? g_exprs->wm_nodes : g_exprs->nodes.size();
-      void* p = mmap(nullptr, fvm_n * sizeof(u64) + 8, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-      if (p == MAP_FAILED) { std::cerr << "nbe: out of memory\n"; abort(); }
-      fvm = (u64*)p;
-    }
+    fvm_n = g_exprs->wm_nodes ? g_exprs->wm_nodes : g_exprs->nodes.size();
     lparams = &c.lparams;
     scope = plist_of(c) + 2;   // an inference checked under these universe parameters
-    steps = 0; budget = g_nbe_budget; depth = 0; probing = false; exhausted = false;
+    steps = 0; budget = g_nbe_budget; depth = 0; arena0 = ar.bytes; probing = false; exhausted = false;
     try {
       Val* s = whnf(0, phase_type(c.type));
       if (s->k != V_SORT) nfail("type expected");
@@ -1420,6 +1446,8 @@ struct Engine {
       probing = false; exhausted = false; depth = 0;
       return false;
     }
+    { static const bool mr = getenv("LL_MEMREPORT") != nullptr;
+      if (mr && ar.bytes > arena0 + ((size_t)64 << 20)) std::cerr << "nbe: " << name_str(c.name) << " allocated " << ((ar.bytes - arena0) >> 20) << " MB, " << steps << " steps\n"; }
     s_steps += steps; s_accept++;
     { u64 b = 0, x = steps; while (x >= 1000 && b < 7) { x /= 10; b++; } s_hist[b]++; }
     return true;
@@ -1427,7 +1455,8 @@ struct Engine {
 };
 
 Engine* g_engine_nbe = nullptr;
-size_t g_session_bytes = getenv("LL_NBE_SESSION_MB") ? (size_t)atol(getenv("LL_NBE_SESSION_MB")) << 20 : (size_t)1536 << 20;
+size_t g_session_bytes = getenv("LL_NBE_SESSION_MB") ? (size_t)atol(getenv("LL_NBE_SESSION_MB")) << 20 : (size_t)128 << 20;
+bool g_session_fixed = getenv("LL_NBE_SESSION_MB") != nullptr;
 
 } // namespace
 
@@ -1436,12 +1465,34 @@ bool nbe_check(const Environment& env, const Decl& d) {
   return g_engine_nbe->check(env, d);
 }
 
+// A session's size follows the export's: about a 44th of the file, between 32 and 128 MB.  A
+// small export does not need long sessions to share its constants, and memory stays low.
+void nbe_size_sessions(size_t export_bytes) {
+  if (g_session_fixed) return;
+  size_t want = export_bytes / 44;
+  g_session_bytes = std::min(std::max(want, (size_t)32 << 20), (size_t)128 << 20);
+}
+
 void nbe_between_decls() {
   if (g_engine_nbe && g_engine_nbe->groot && g_engine_nbe->ar.bytes > g_session_bytes) g_engine_nbe->start_session();
 }
 
 void nbe_report() {
   if (!g_engine_nbe) return;
+  if (getenv("LL_MEMREPORT")) {
+    Engine& g = *g_engine_nbe; size_t t = 0;
+    auto cap = [&](size_t m, size_t sz) { size_t b = g.c_eval.t ? (m + 1) * sz : 0; t += b; return b >> 20; };
+    std::cerr << "nbe tables MB: eval " << cap(g.c_eval.mask, 24) << " app " << cap(g.c_app.mask, 24) << " env " << cap(g.c_env.mask, 24)
+              << " infer " << cap(g.c_infer.mask, 32) << " pos " << cap(g.c_pos.mask, 24) << " neg " << cap(g.c_neg.mask, 24)
+              << " frame " << cap(g.c_frame.mask, 24) << " vtype " << cap(g.c_vtype.mask, 24) << " head " << cap(g.c_head.mask, 24)
+              << " type " << cap(g.c_type.mask, 24) << " unfold " << cap(g.c_unfold.mask, 24)
+              << " rule " << (g.c_rule.t ? cap(g.c_rule.mask, 24) : 0) << " bvar " << (g.c_bvar.t ? cap(g.c_bvar.mask, 24) : 0) << " lit " << (g.c_lit.t ? cap(g.c_lit.mask, 24) : 0)
+              << " lvl " << (g.c_lvl.t ? cap(g.c_lvl.mask, 24) : 0) << " isprop " << (g.c_isprop.t ? cap(g.c_isprop.mask, 24) : 0)
+              << " sig " << (g.c_sig.t ? cap(g.c_sig.mask, 24) : 0) << "+" << (g.c_sig.n * 48 >> 20) << " norm " << (g.p_norm.t ? cap(g.p_norm.mask, 24) : 0)
+              << " var0 " << (g.p_var0.t ? cap(g.p_var0.mask, 24) : 0) << " nats " << g.nats.size() << "; total " << (t >> 20)
+              << " MB; arena blocks " << (g.ar.blocks.size() * Arena::BLOCK >> 20) << " MB\n";
+    std::cerr << "expr nodes " << g_exprs->nodes.size() << " x " << sizeof(ExprNode) << " B (capacity " << (g_exprs->nodes.capacity() * sizeof(ExprNode) >> 20) << " MB)\n";
+  }
   std::cerr << "nbe: " << s_accept << " accepted, " << s_decline << " declined; " << s_steps << " steps; " << s_sessions << " sessions\n";
   for (auto& p : s_reasons) std::cerr << "  declined (" << p.first << "): " << p.second << "\n";
   std::cerr << "nbe steps per accepted declaration: <1e3 " << s_hist[0] << ", <1e4 " << s_hist[1] << ", <1e5 " << s_hist[2] << ", <1e6 " << s_hist[3]

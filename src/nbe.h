@@ -28,6 +28,7 @@ struct NbeFail { const char* why; };
 bool nbe_check(const Environment& env, const Decl& d);
 // Between declarations: end the session if its arena has grown past the budget.
 void nbe_between_decls();
+void nbe_size_sessions(size_t export_bytes);   // default session size from the export's size
 void nbe_report();          // statistics to stderr
 extern bool g_nbe;          // engine enabled (default on; LL_NBE=0 or --no-nbe turns it off)
 
