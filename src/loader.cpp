@@ -69,7 +69,13 @@ struct Loader {
       while (p < e && *p >= '0' && *p <= '9') { x = x * 10 + (u64)(*p - '0'); p++; }
       v = x; return true;
     }
-    bool at_end() const { return p == e; }
+    // the line ends here: advance past its terminator
+    bool at_end() {
+      if (p == e) return true;
+      if (*p == '\n') { p++; return true; }
+      if (*p == '\r' && p + 1 < e && p[1] == '\n') { p += 2; return true; }
+      return false;
+    }
   };
   bool binfo_fast(Cur& c, BInfo& bi) {
     if (c.lit("default\"")) { bi = BInfo::Default; return true; }
@@ -81,84 +87,89 @@ struct Loader {
   Expr exi(u64 i) { if (i >= exprs.size()) fail("expr index out of range"); return exprs[i]; }
   Name nmi(u64 i) { if (i >= names.size()) fail("name index out of range"); return names[i]; }
   Level lvi(u64 i) { if (i >= levels.size()) fail("level index out of range"); return levels[i]; }
-  void put_expr(u64 idx, Expr e) { set_at(exprs, idx, e); out.nexprs++; }
+  void put_expr(u64 idx, Expr e) {
+    if (idx == exprs.size()) exprs.push_back(e); else set_at(exprs, idx, e);
+    out.nexprs++;
+  }
 
-  bool fast(const char* b, const char* e) {
+  // Parse one line starting at b (the buffer ends at e).  Returns the start of the next line,
+  // or nullptr if the line is not one of the shapes recognised here.
+  const char* fast(const char* b, const char* e) {
     Cur c{b, e};
     u64 n, a, f, t, bd, nm_;
     BInfo bi;
     if (c.lit("{\"app\":{\"arg\":")) {
       if (c.num(a) && c.lit(",\"fn\":") && c.num(f) && c.lit("},\"ie\":") && c.num(n) && c.lit("}") && c.at_end()) {
-        put_expr(n, mk_app(exi(f), exi(a))); return true;
+        put_expr(n, bulk_app(exi(f), exi(a))); return c.p;
       }
-      return false;
+      return nullptr;
     }
     if (c.lit("{\"ie\":")) {
-      if (!c.num(n)) return false;
+      if (!c.num(n)) return nullptr;
       if (c.lit(",\"lam\":{\"binderInfo\":\"")) {
         if (binfo_fast(c, bi) && c.lit(",\"body\":") && c.num(bd) && c.lit(",\"name\":") && c.num(nm_) &&
             c.lit(",\"type\":") && c.num(t) && c.lit("}}") && c.at_end()) {
-          put_expr(n, mk_lam(nmi(nm_), exi(t), exi(bd), bi)); return true;
+          put_expr(n, bulk_binding(false, nmi(nm_), exi(t), exi(bd), bi)); return c.p;
         }
-        return false;
+        return nullptr;
       }
       if (c.lit(",\"sort\":")) {
-        if (c.num(a) && c.lit("}") && c.at_end()) { put_expr(n, mk_sort(lvi(a))); return true; }
-        return false;
+        if (c.num(a) && c.lit("}") && c.at_end()) { put_expr(n, mk_sort(lvi(a))); return c.p; }
+        return nullptr;
       }
-      return false;
+      return nullptr;
     }
     if (c.lit("{\"forallE\":{\"binderInfo\":\"")) {
       if (binfo_fast(c, bi) && c.lit(",\"body\":") && c.num(bd) && c.lit(",\"name\":") && c.num(nm_) &&
           c.lit(",\"type\":") && c.num(t) && c.lit("},\"ie\":") && c.num(n) && c.lit("}") && c.at_end()) {
-        put_expr(n, mk_pi(nmi(nm_), exi(t), exi(bd), bi)); return true;
+        put_expr(n, bulk_binding(true, nmi(nm_), exi(t), exi(bd), bi)); return c.p;
       }
-      return false;
+      return nullptr;
     }
     if (c.lit("{\"const\":{\"name\":")) {
-      if (!c.num(nm_) || !c.lit(",\"us\":[")) return false;
+      if (!c.num(nm_) || !c.lit(",\"us\":[")) return nullptr;
       lv_scratch.clear();
       if (!c.lit("]")) {
         while (true) {
-          if (!c.num(a)) return false;
+          if (!c.num(a)) return nullptr;
           lv_scratch.push_back(lvi(a));
           if (c.lit(",")) continue;
           if (c.lit("]")) break;
-          return false;
+          return nullptr;
         }
       }
       if (c.lit("},\"ie\":") && c.num(n) && c.lit("}") && c.at_end()) {
-        put_expr(n, mk_const(nmi(nm_), g_levels->mk_list(lv_scratch))); return true;
+        put_expr(n, mk_const(nmi(nm_), g_levels->mk_list(lv_scratch))); return c.p;
       }
-      return false;
+      return nullptr;
     }
     if (c.lit("{\"bvar\":")) {
       if (c.num(a) && c.lit(",\"ie\":") && c.num(n) && c.lit("}") && c.at_end()) {
-        put_expr(n, mk_bvar((u32)a)); return true;
+        put_expr(n, mk_bvar((u32)a)); return c.p;
       }
-      return false;
+      return nullptr;
     }
     if (c.lit("{\"in\":")) {
-      if (!c.num(n)) return false;
+      if (!c.num(n)) return nullptr;
       if (c.lit(",\"str\":{\"pre\":")) {
-        if (!c.num(a) || !c.lit(",\"str\":\"")) return false;
+        if (!c.num(a) || !c.lit(",\"str\":\"")) return nullptr;
         const char* s0 = c.p;
-        while (c.p < c.e && *c.p != '"' && *c.p != '\\') c.p++;
-        if (c.p >= c.e || *c.p != '"') return false;   // an escape: let the JSON reader decode it
+        while (c.p < c.e && *c.p != '"' && *c.p != '\\' && *c.p != '\n') c.p++;
+        if (c.p >= c.e || *c.p != '"') return nullptr;   // an escape: let the JSON reader decode it
         std::string_view sv(s0, (size_t)(c.p - s0));
         c.p++;
-        if (!c.lit("}}") || !c.at_end()) return false;
-        set_at(names, n, g_names->mk_str(nmi(a), sv)); out.nnames++; return true;
+        if (!c.lit("}}") || !c.at_end()) return nullptr;
+        set_at(names, n, g_names->mk_str(nmi(a), sv)); out.nnames++; return c.p;
       }
       if (c.lit(",\"num\":{\"i\":")) {
         if (c.num(a) && c.lit(",\"pre\":") && c.num(f) && c.lit("}}") && c.at_end()) {
-          set_at(names, n, g_names->mk_num(nmi(f), a)); out.nnames++; return true;
+          set_at(names, n, g_names->mk_num(nmi(f), a)); out.nnames++; return c.p;
         }
-        return false;
+        return nullptr;
       }
-      return false;
+      return nullptr;
     }
-    return false;
+    return nullptr;
   }
   std::vector<Level> lv_scratch;
 
@@ -266,6 +277,7 @@ ExportFile load_export(const std::string& path, bool verbose) {
   static const bool no_bulk = getenv("LL_LOAD_SEQUENTIAL") != nullptr;
   if (!no_bulk) {
     ExportFile ef = load_once(path, verbose, true);
+    if (getenv("LL_DEBUG_NO_INDEX")) return ef;   // measurement only: the permanent tier is left unindexed
     if (g_exprs->build_index(8)) return ef;
     std::cerr << "note: the export repeats an expression; loading it again with ordinary interning\n";
     g_exprs->reset_permanent();
@@ -308,16 +320,22 @@ static ExportFile load_once(const std::string& path, bool verbose, bool bulk) {
       madvise((void*)released, (size_t)(upto - released), MADV_DONTNEED);
       released = upto;
     }
+    L.line++;
+    if (!no_fast) {   // the common line shapes are parsed up to and including their terminator
+      const char* next = nullptr;
+      try { next = L.fast(q, end); }
+      catch (KernelError& e) { munmap((void*)base, sz); fail("line " + std::to_string(L.line) + ": " + e.what()); }
+      if (next) { q = next; continue; }
+    }
     const char* nl = (const char*)memchr(q, '\n', (size_t)(end - q));
     const char* le = nl ? nl : end;
-    L.line++;
     const char* lb = q;
     const char* lx = le;
     if (lx > lb && lx[-1] == '\r') lx--;
     q = nl ? nl + 1 : end;
     if (lx == lb) continue;
     try {
-      if (no_fast || !L.fast(lb, lx)) {
+      {
         JParser pz(lb, lx);
         JVal v = pz.parse();
         L.handle(v);

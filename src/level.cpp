@@ -117,7 +117,18 @@ static Level mk_max_list(const std::vector<Level>& args) {
   return r;
 }
 
+static Level normalize_core(Level l);
+// Normalisation is memoised by level handle: levels are interned, and the kernel normalises the
+// same few thousand levels over and over.
 Level normalize(Level l) {
+  static std::vector<Level> memo;
+  if (l < memo.size() && memo[l] != NIL) return memo[l];
+  Level r = normalize_core(l);
+  if (l >= memo.size()) memo.resize(std::max<size_t>(l + 1, memo.size() * 2 + 1024), NIL);
+  memo[l] = r;
+  return r;
+}
+static Level normalize_core(Level l) {
   auto p = to_offset(l);
   Level r = p.first;
   switch (lv(r).kind) {

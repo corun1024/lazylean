@@ -117,6 +117,8 @@ Expr mk_sort(Level l);
 Expr mk_const(Name n, LevelList ls);
 inline Expr mk_const(Name n) { return mk_const(n, 0); }
 Expr mk_app(Expr f, Expr a);
+Expr bulk_app(Expr f, Expr a);                                     // loader only (see expr.cpp)
+Expr bulk_binding(bool pi, Name n, Expr dom, Expr body, BInfo bi);
 Expr mk_lam(Name n, Expr dom, Expr body, BInfo bi);
 Expr mk_pi(Name n, Expr dom, Expr body, BInfo bi);
 Expr mk_let(Name n, Expr type, Expr val, Expr body);

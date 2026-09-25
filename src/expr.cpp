@@ -220,6 +220,25 @@ static ExprNode node_proj(Name s, u32 idx, Expr e) {
   return ExprNode{EKind::Proj, BInfo::Default, ne.flags, ne.loose_bvar_range, idx, e, 0, s, 0, h};
 }
 Expr mk_app(Expr f, Expr a) { return g_exprs->intern(node_app(f, a)); }
+
+// The loader's bulk path: while the permanent tier is being appended (see ExprTable::bulk) a
+// node is pushed without any lookup, reading only the fields of its children it needs.
+Expr bulk_app(Expr f, Expr a) {
+  ExprTable& T = *g_exprs;
+  if (!T.bulk) return mk_app(f, a);
+  const ExprNode* nd = T.nodes.data();
+  const u8 fl = nd[f].flags | nd[a].flags;
+  const u32 lbr = std::max(nd[f].loose_bvar_range, nd[a].loose_bvar_range);
+  const u64 h = hk(EKind::App, mix(nd[f].hash, nd[a].hash));
+  T.nodes.push_back(ExprNode{EKind::App, BInfo::Default, fl, lbr, f, a, 0, 0, 0, h});
+  return (u32)T.nodes.size() - 1;
+}
+Expr bulk_binding(bool pi, Name n, Expr dom, Expr body, BInfo bi) {
+  ExprTable& T = *g_exprs;
+  if (!T.bulk) return pi ? mk_pi(n, dom, body, bi) : mk_lam(n, dom, body, bi);
+  T.nodes.push_back(node_binding(pi ? EKind::Pi : EKind::Lam, n, dom, body, bi));
+  return (u32)T.nodes.size() - 1;
+}
 static Expr mk_binding(EKind k, Name n, Expr dom, Expr body, BInfo bi) { return g_exprs->intern(node_binding(k, n, dom, body, bi)); }
 Expr mk_lam(Name n, Expr dom, Expr body, BInfo bi) { return mk_binding(EKind::Lam, n, dom, body, bi); }
 Expr mk_pi(Name n, Expr dom, Expr body, BInfo bi) { return mk_binding(EKind::Pi, n, dom, body, bi); }

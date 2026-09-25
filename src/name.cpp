@@ -66,12 +66,20 @@ Name NameTable::of_string(std::string_view s) {
 // numeric components before string components.
 bool NameTable::lt(Name a, Name b) const {
   if (a == b) return false;
-  std::vector<Name> ca, cb;
-  for (Name x = a; x != 0; x = nodes[x].parent) ca.push_back(x);
-  for (Name x = b; x != 0; x = nodes[x].parent) cb.push_back(x);
-  size_t i = ca.size(), j = cb.size();
+  // the common case, universe parameters such as `u_1` and `v`: one component, same prefix
+  const NameNode& na = nodes[a]; const NameNode& nb = nodes[b];
+  if (na.parent == nb.parent) {
+    if (na.is_str != nb.is_str) return !na.is_str;   // num < str
+    if (na.is_str) return na.str < nb.str;
+    return na.num < nb.num;
+  }
+  Name ca[64], cb[64]; size_t i = 0, j = 0;
+  std::vector<Name> va, vb;   // only for names more than 64 components deep
+  for (Name x = a; x != 0; x = nodes[x].parent) { if (i < 64) ca[i] = x; else va.push_back(x); i++; }
+  for (Name x = b; x != 0; x = nodes[x].parent) { if (j < 64) cb[j] = x; else vb.push_back(x); j++; }
+  auto at = [](Name* c, std::vector<Name>& v, size_t k) { return k < 64 ? c[k] : v[k - 64]; };
   while (i > 0 && j > 0) {
-    const NameNode& x = nodes[ca[i - 1]]; const NameNode& y = nodes[cb[j - 1]];
+    const NameNode& x = nodes[at(ca, va, i - 1)]; const NameNode& y = nodes[at(cb, vb, j - 1)];
     if (x.is_str != y.is_str) return !x.is_str;  // num < str
     if (x.is_str) { if (x.str != y.str) return x.str < y.str; }
     else if (x.num != y.num) return x.num < y.num;
