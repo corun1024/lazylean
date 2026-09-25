@@ -223,7 +223,7 @@ struct Frame {
 
 struct MachineRun {
   Machine& M;
-  TypeChecker& tc;
+  MachineCtx& tc;
   Expr h = NIL; Ref<Env> env; bool delta; bool cheap_proj;
   std::vector<Frame> st;
   MachineRun(Machine& m, bool d, bool cp) : M(m), tc(m.tc), delta(d), cheap_proj(cp) {}
@@ -266,12 +266,6 @@ struct MachineRun {
     if (t->state == 2) { h = t->vterm; env = std::move(t->venv); std::vector<Ref<Thunk>> a; a.swap(t->args); push_args(a); }
     else if ((probe && g_orig_policy >= 1) || g_orig_policy == 2) { h = t->term; env = t->env; }
     else { h = t->term; env = std::move(t->env); t->term = NIL; }
-    // Start a closed term from its cached whnf_core result when the checker has one (the
-    // reference's recursive whnf_core would hit that cache); the closure itself stays as written.
-    if (!env && !has_loose_bvars(h)) {
-      auto it = tc.whnf_core_cache.find(h);
-      if (it != tc.whnf_core_cache.end() && it->second != h) h = it->second;
-    }
     if (g_hist) { g_state_live[t->state]--; g_state_live[1]++; }
     t->state = 1; t->rb = NIL;
   }
@@ -339,7 +333,7 @@ struct MachineRun {
       M.force(major.get(), true);
     } else if (!is_ctor_head(tc.env, head, nullptr) && tc.env.is_structure_like(rec.major_induct)) {
       Expr m = M.readback_value(major.get());
-      Expr m2 = tc.to_ctor_when_struct(rec.major_induct, m);
+      Expr m2 = tc.k.to_ctor_when_struct(rec.major_induct, m);
       if (m2 != m) { major = M.closed(m2); M.force(major.get(), true); }
     }
     head = major->vterm;
@@ -379,7 +373,7 @@ struct MachineRun {
   // mentions is not built at all (a `casesOn` ignores them): its cell holds a placeholder that
   // no lookup can reach, since the body has no occurrence of that variable.
   bool select_branch(const ConstInfo& rec, Expr rhs, u32 nbefore, u32 nfields, std::vector<Ref<Thunk>>& args, Thunk& major) {
-    TypeChecker::RuleShape& sh = tc.rule_shapes[rhs];
+    MachineCtx::RuleShape& sh = tc.rule_shapes[rhs];
     if (sh.ok < 0) {
       sh.ok = 0;
       Expr b = rhs; u32 nl = 0;
@@ -563,7 +557,7 @@ struct MachineRun {
           Thunk* major = args[major_idx].get();
           if (c->k && major->state != 3) {
             Expr m = M.readback(major);
-            Expr m2 = tc.to_ctor_when_K(*c, m);
+            Expr m2 = tc.k.to_ctor_when_K(*c, m);
             if (m2 != m) { args[major_idx] = M.closed(m2); major = args[major_idx].get(); }
           }
           if (major->state != 3) {
@@ -634,7 +628,6 @@ struct MachineRun {
         }
         if (delta && c->is_delta() && g_levels->list_size(const_levels(h)) == c->lparams.size()) {
           g_k_delta++; M.steps++; if (g_hist) g_delta_hist[n]++;
-          if (is_recursion_wrapper(*c)) count_wrapper();
           h = M.unfold_body(h); env = Ref<Env>(); return false;
         }
         return true;

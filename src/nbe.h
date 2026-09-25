@@ -1,4 +1,4 @@
-// A second checking engine for definitions, theorems and axioms: normalisation by evaluation.
+// The type checker: normalisation by evaluation.
 //
 // Terms are evaluated into semantic values (closures over environments, neutral applications
 // with a spine of eliminations), and the type checker works on values: beta is a cons onto an
@@ -10,11 +10,9 @@
 // instance's unfolding or a conversion already decided is paid for once per session rather
 // than once per declaration.
 //
-// The engine is a fast path, not a replacement.  It may decline a declaration (NbeFail) for any
-// reason -- a construct it does not handle, a budget exceeded, or a check that fails -- and the
-// caller then checks the declaration again with the reference type checker (tc.cpp), whose
-// verdict is final.  So a rejection here costs time, never correctness; what must hold is that
-// the engine accepts only well-typed declarations.
+// A declaration that computes (it runs past the main session's step or allocation budget) is
+// checked again in a scratch session, where the lazy machine (kam.cpp) reduces closed terms.
+// check_decl (kernel.h) is the entry point; NbeFail is internal to the engine.
 #pragma once
 #include "env.h"
 
@@ -22,14 +20,9 @@ namespace ll {
 
 struct NbeFail { const char* why; };
 
-// Check a definition, theorem, axiom or opaque declaration.  Returns true if accepted (the
-// caller adds the constant); false if the engine declined or the check failed (the caller falls
-// back to the reference checker).  Inductive and quotient declarations are not handled here.
-bool nbe_check(const Environment& env, const Decl& d);
-// Between declarations: end the session if its arena has grown past the budget.
+// Between declarations: end the main session if its arena has grown past the budget.
 void nbe_between_decls();
 void nbe_size_sessions(size_t export_bytes);   // default session size from the export's size
 void nbe_report();          // statistics to stderr
-extern bool g_nbe;          // engine enabled (default on; LL_NBE=0 or --no-nbe turns it off)
 
 } // namespace ll

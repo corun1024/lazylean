@@ -1,6 +1,6 @@
 #include "fix.h"
 #include "fuse.h"
-#include "tc.h"
+#include "kernel.h"
 #include "level.h"
 #include <iostream>
 #include <unordered_map>
@@ -153,7 +153,7 @@ bool derive(const Environment& env, const ConstInfo& c, FixRule& out) {
   Expr fconst = mk_const(c.name, g_levels->mk_list(lvls));
   size_t lctx0 = g_lctx.decls.size();
   struct Pop { size_t m; ~Pop() { g_lctx.decls.resize(m); } } pop{lctx0};
-  TypeChecker tc(env, c.lparams, Safety::Safe);
+  Kernel tc(env, c.lparams, Safety::Safe);
   std::vector<Expr> xs;   // x_1 .. x_n (and the eta major for the partial shape)
   Expr ty = c.type;
   size_t total = has_major ? n : n + 1;
@@ -257,7 +257,8 @@ bool derive(const Environment& env, const ConstInfo& c, FixRule& out) {
     Expr lhs = mk_apps(mk_app(f_prefix, ctor_app), std::vector<Expr>(xs.begin() + std::min(xs.size(), k), xs.end()));
     bool ok = false;
     // (R already has the trailing arguments applied: B is the head part applied to them)
-    try { ok = tc.is_def_eq(lhs, Rp); } catch (KernelError&) { ok = false; }
+    try { ok = tc.is_def_eq(lhs, Rp); } catch (KernelError& e) { ok = false; if (g_fix_trace) std::cerr << "[fix] " << name_str(c.name) << ": " << e.what() << "\n"; }
+    if (!ok && g_fix_trace) std::cerr << "[fix]   lhs " << expr_str(lhs).substr(0, 300) << "\n[fix]   rhs " << expr_str(Rp).substr(0, 300) << "\n";
     if (!ok) { g_lctx.decls.resize(lctx1); if (g_fix_trace) std::cerr << "[fix] " << name_str(c.name) << ": arm " << name_str(ctor_name) << " not verified\n"; return reject(c, 16); }
     // abstract over x_1..x_{k-1}, fields, x_{k+1}..x_n
     std::vector<Expr> binders(xs.begin(), xs.begin() + (k - 1));

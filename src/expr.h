@@ -102,6 +102,7 @@ private:
   InternTable<SH, SE>* stable; InternTable<SH, SE>* tstable;
 };
 extern ExprTable* g_exprs;
+extern const ExprNode* g_node_base;   // g_exprs->nodes.data(), kept current as the table grows
 extern u64 g_int_perm_probe, g_int_perm_hit, g_int_temp_hit, g_int_new, g_int_kind[16];   // intern statistics
 extern u64 g_cnt_clos, g_cnt_clos_compose, g_cnt_clos_expand, g_cnt_expose, g_cnt_env;
 // `ex` looks through closure nodes: a Clos handle presents the node of its exposed form, so

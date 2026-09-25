@@ -20,8 +20,13 @@
 // session, because the environment only grows and a value's meaning does not depend on where it
 // is used (a fresh variable is identified by its level and its type).
 #include "nbe.h"
+#include "kernel.h"
+#include "kam.h"
+#include "fuse.h"
 #include <gmpxx.h>
 #include <deque>
+#include <array>
+#include <unordered_map>
 #include <cstring>
 #include <iostream>
 #include <algorithm>
@@ -31,11 +36,13 @@
 
 namespace ll {
 
-bool g_nbe = !getenv("LL_NBE") || atoi(getenv("LL_NBE")) != 0;
 
 namespace {
 
 [[noreturn]] void nfail(const char* why) { throw NbeFail{why}; }
+[[noreturn]] void nfail_unknown(Name n) {   // the message names the constant (kept in a static buffer)
+  static std::string msg; msg = "unknown constant '" + name_str(n) + "'"; throw NbeFail{msg.c_str()};
+}
 
 // Large regions come straight from mmap with a huge-page hint, and are kept for the whole run:
 // a session reset zeroes and reuses them, so the kernel's page-fault work is paid once.
@@ -170,7 +177,7 @@ constexpr u64 HI = 1ull << 63;   // tags integer keys so that they are never 0 a
 // ---------------------------------------------------------------- values
 
 enum : u8 { V_NEU, V_LAM, V_PI, V_SORT, V_NAT, V_STR };
-enum : u8 { H_BVAR, H_AXIOM, H_CTOR, H_INDUCT, H_REC, H_QUOT, H_DEF };
+enum : u8 { H_BVAR, H_AXIOM, H_CTOR, H_INDUCT, H_REC, H_QUOT, H_DEF, H_FVAR };   // H_FVAR: a free variable of the local context (term-level interface); n.ls holds its let-value term, or NIL
 
 struct Val; struct Env; struct LSub;
 
@@ -204,12 +211,18 @@ Val g_stuck_obj;
 Val* const STUCK = &g_stuck_obj;
 Val g_unused;
 extern size_t g_session_bytes;
-const size_t g_decl_arena = getenv("LL_NBE_DECL_MB") ? (size_t)atol(getenv("LL_NBE_DECL_MB")) << 20 : (size_t)64 << 20;
+const size_t g_decl_arena = getenv("LL_NBE_DECL_MB") ? (size_t)atol(getenv("LL_NBE_DECL_MB")) << 20 : (size_t)64 << 20;   // the main session's allocation budget per declaration
 const u64 g_nbe_budget = getenv("LL_NBE_BUDGET") ? strtoull(getenv("LL_NBE_BUDGET"), nullptr, 10) : 1000000;
 u64 s_hist[8] = {0};   // declarations by steps: <1e3, <1e4, .. <1e9, more   // stands for an argument whose variable the term it is bound in never mentions
 
-const ExprNode* g_nodes = nullptr;   // the expression table, fixed while the engine runs
-inline const ExprNode& node(Expr e) { return g_nodes[e]; }
+// The expression table can grow while the engine runs (the term-level interface reads terms
+// back, the lazy machine builds its results), so a node is read through the table each time,
+// and a function that may reach such a call keeps a copy of its node rather than a reference.
+inline const ExprNode& node(Expr e) { return g_node_base[e]; }
+// the variable sets of permanent terms more than 64 binders deep (Engine::wide_bits), each a
+// count and that many variables of a byte each; nodes hold offsets into it (plus one), so it is
+// shared by every engine
+std::vector<u8> g_wide_sets;
 
 // ---------------------------------------------------------------- statistics
 
@@ -249,7 +262,11 @@ struct Engine {
   // per declaration
   const std::vector<Name>* lparams = nullptr;
   u32 scope = 1;
-  u64 steps = 0, budget = 0; size_t arena0 = 0;
+  u64 steps = 0, budget = 0; size_t arena0 = 0, decl_arena = 0;
+  Safety safety = Safety::Safe;
+  bool machine = false;           // hand closed terms to the lazy machine (declarations that compute)
+  MachineCtx* mctx = nullptr;
+  bool in_check = false;
   u32 depth = 0;
   bool probing = false, exhausted = false; u32 probe_left = 0;
 
@@ -258,23 +275,24 @@ struct Engine {
     explicit Guard(Engine& e) : g(e) { if (++g.depth > 100000) nfail("recursion depth"); }
     ~Guard() { g.depth--; }
   };
-  // A declaration that computes is declined past a step budget or an allocation budget, and the
-  // reference checker's lazy machine -- the better engine for evaluation, and frugal with
-  // memory -- checks it instead.
+  // A declaration that computes runs past a step budget or an allocation budget in the main
+  // session, and is checked again in the scratch session with the lazy machine -- the better
+  // engine for evaluation, and frugal with memory -- reducing its closed terms.
   void tick() {
     if (++steps > budget) nfail("step budget");
-    if (ar.bytes > arena0 + g_decl_arena) nfail("memory budget");
+    if (ar.bytes > arena0 + decl_arena) nfail("memory budget");
   }
 
-  void start_session() {
-    ar.reset(g_session_bytes);
+  bool scratch_session = false;   // emptied after every use: keeps one arena block, not a session's worth
+  void start_session(bool trim = true) {
+    ar.reset(scratch_session ? 0 : g_session_bytes);
     c_head.clear(); c_type.clear(); c_unfold.clear(); c_rule.clear(); c_eval.clear(); c_env.clear();
     c_bvar.clear(); c_app.clear(); c_lit.clear(); c_vtype.clear(); c_lvl.clear(); c_lsub.clear();
-    c_pos.clear(); c_neg.clear(); c_isprop.clear(); c_infer.clear(); c_frame.clear(); memset(prune_dm, 0, sizeof(PruneDM) << PRUNE_DM_BITS);
+    c_pos.clear(); c_neg.clear(); c_isprop.clear(); c_infer.clear(); c_frame.clear(); c_fvar.clear(); c_closed.clear(); memset(prune_dm, 0, sizeof(PruneDM) << PRUNE_DM_BITS);
     nats.clear(); lsubs.clear();
     groot = ar.make<Env>();
     s_sessions++;
-    malloc_trim(0);   // hand back what earlier declarations freed (the export's copies of constants)
+    if (trim) malloc_trim(0);   // hand back what earlier declarations freed (the export's copies of constants)
   }
 
   // ---------------------------------------------------------------- levels
@@ -378,7 +396,8 @@ struct Engine {
   static bool wide_kind(EKind k) { return k == EKind::App || k == EKind::Lam || k == EKind::Pi || k == EKind::Proj; }
   inline u64 fv_mask(Expr e) {
     if (e < fvm_n) {
-      const ExprNode& n = g_nodes[e];
+      const ExprNode& n = node(e);
+      if (n.loose_bvar_range > 64) return ~0ull;   // (the fields hold a wide set's index, below)
       if (wide_kind(n.kind)) { u64 m = ((u64)n.c << 32) | n.lvls; if (m) return m; }
       else if (n.kind == EKind::Let && n.lvls) return n.lvls == ~0u ? ~0ull : n.lvls;
     }
@@ -400,7 +419,11 @@ struct Engine {
       case EKind::Proj: r = fv_mask(n.b); break;
       default: r = ~0ull;
     }
-    ExprNode& w = const_cast<ExprNode&>(g_nodes[e]);
+    if (r == ~0ull && n.kind != EKind::BVar) {   // a subterm is deeper than 64 binders, this term is not
+      WBits b;
+      if (wide_compute(n, b) && b.w[0]) r = b.w[0];
+    }
+    ExprNode& w = const_cast<ExprNode&>(node(e));
     if (wide_kind(n.kind)) { w.lvls = (u32)r; w.c = (u32)(r >> 32); }
     else if (n.kind == EKind::Let) w.lvls = (r >> 32) ? ~0u : (u32)r;
     return r;
@@ -422,6 +445,59 @@ struct Engine {
     else { f = prune(env, m); dm.env = env; dm.mask = m; dm.frame = f; }
     env->pm = m; env->pr = f;
     return f;
+  }
+  // The variables of a term more than 64 binders deep, as a 256-bit set, memoised for such terms
+  // only: a term under it that is not so deep gets its exact mask from them (else the unknown
+  // mask of one deep subterm would leave every term above it unpruned, and a proof 73 binders
+  // deep re-inferred the same subterms ninety thousand times each).  Past 256 binders a term is
+  // left unpruned.
+  // A deep permanent term's set is kept in a flat array, and its index (plus one; ~0 for "not
+  // known") in the node field that holds a shallower term's mask.
+  struct WBits { u64 w[4]; bool ok; };
+  bool wide_bits(Expr e, WBits& out) {
+    const ExprNode n = node(e);
+    if (n.loose_bvar_range <= 64) {
+      u64 m = fv_mask(e);
+      out = WBits{{m, 0, 0, 0}, m != ~0ull};   // (all 64 is unknown too: never a superset, the caller looks each one up)
+      return out.ok;
+    }
+    if (n.loose_bvar_range > 256) return false;
+    if (n.kind == EKind::BVar) { out = WBits{{0, 0, 0, 0}, true}; out.w[n.a >> 6] |= 1ull << (n.a & 63); return true; }
+    if (e >= fvm_n || !(wide_kind(n.kind) || n.kind == EKind::Let)) return false;
+    if (n.lvls) {
+      if (n.lvls == ~0u) return false;
+      const u8* p = g_wide_sets.data() + n.lvls - 1;
+      out = WBits{{0, 0, 0, 0}, true};
+      for (u32 i = 1, k = (u32)p[0] + 1; i <= k; i++) out.w[p[i] >> 6] |= 1ull << (p[i] & 63);
+      return true;
+    }
+    out.ok = wide_compute(n, out);
+    ExprNode& wn = const_cast<ExprNode&>(node(e));
+    if (!out.ok || g_wide_sets.size() >= ~0u - 300) { wn.lvls = ~0u; return out.ok; }
+    u32 at = (u32)g_wide_sets.size(), cnt = 0;
+    g_wide_sets.push_back(0);
+    for (u32 i = 0; i < 256; i++) if (out.w[i >> 6] >> (i & 63) & 1) { g_wide_sets.push_back((u8)i); cnt++; }
+    g_wide_sets[at] = (u8)(cnt - 1);   // (a deep term mentions at least one variable)
+    wn.lvls = at + 1;
+    return true;
+  }
+  bool wide_compute(const ExprNode& n, WBits& out) {
+    out = WBits{{0, 0, 0, 0}, true};
+    auto add = [&](Expr x, bool shift) {
+      if (!out.ok) return;
+      WBits c;
+      if (!wide_bits(x, c)) { out.ok = false; return; }
+      for (int i = 0; i < 4; i++) out.w[i] |= shift ? (c.w[i] >> 1) | (i < 3 ? c.w[i + 1] << 63 : 0) : c.w[i];
+    };
+    switch (n.kind) {
+      case EKind::BVar: if (n.a >= 256) return out.ok = false; out.w[n.a >> 6] |= 1ull << (n.a & 63); break;
+      case EKind::App: add(n.a, false); add(n.b, false); break;
+      case EKind::Lam: case EKind::Pi: add(n.a, false); add(n.b, true); break;
+      case EKind::Let: add(n.a, false); add(n.b, false); add(n.c, true); break;
+      case EKind::Proj: add(n.b, false); break;
+      default: out.ok = false; break;
+    }
+    return out.ok;
   }
   static constexpr unsigned PRUNE_DM_BITS = 16;
   struct PruneDM { Env* env; u64 mask; Env* frame; };
@@ -487,6 +563,19 @@ struct Engine {
     Val* v = ar.make<Val>(); v->k = V_PI; v->pinf = pinf; v->pi.dom = dom; v->pi.env = env; v->pi.body = body;
     return v;
   }
+  PMap<Val*> c_fvar;
+  // The value of free variable `id` as the local context has it now (a let-bound variable
+  // keeps its value term, unfolded on demand like a definition).
+  Val* fvar_val(u32 id) {
+    if (id >= g_lctx.decls.size()) nfail("unknown free variable");
+    const LocalDecl ld = g_lctx.decls[id];
+    u64 b = ((u64)ld.type << 32) | ld.value;
+    if (Val** c = c_fvar.find(HI | id, b)) return *c;
+    Val* v = ar.make<Val>(); v->k = V_NEU; v->hk = H_FVAR; v->a = id; v->n.ls = ld.value;
+    c_fvar.put(HI | id, b, v);
+    v->n.bty = eval(groot, ld.type);
+    return v;
+  }
   Val* fresh(u32 d, Val* ty) {
     if (Val** c = c_bvar.find(HI | d, (u64)ty)) return *c;
     Val* v = ar.make<Val>(); v->k = V_NEU; v->hk = H_BVAR; v->a = d; v->n.bty = ty;
@@ -505,10 +594,12 @@ struct Engine {
   }
   Val* const_head(Name n, LevelList ls) {
     if (Val** c = c_head.find(HI | n, ls)) return *c;
+    // A constant that is not (yet) declared is an opaque atom: comparing terms that mention it
+    // needs no declaration (a recursor's rules name the recursor before it is added); typing one
+    // does, and inference fails on it.
     const ConstInfo* ci = E->find(n);
-    if (!ci) nfail("unknown constant");
-    Val* v = ar.make<Val>(); v->k = V_NEU; v->hk = head_kind(*ci); v->a = n; v->n.ls = ls;
-    c_head.put(HI | n, ls, v);
+    Val* v = ar.make<Val>(); v->k = V_NEU; v->hk = ci ? head_kind(*ci) : H_AXIOM; v->a = n; v->n.ls = ls;
+    if (ci) c_head.put(HI | n, ls, v);   // (an undeclared constant's atom is not remembered: it may be declared later)
     return v;
   }
   Val* neu_app(Val* f, u64 e) {
@@ -535,6 +626,7 @@ struct Engine {
   // the neutral with the same head and an empty spine
   Val* head_of(Val* v) {
     if (v->hk == H_BVAR) return fresh(v->a, v->n.bty);
+    if (v->hk == H_FVAR) return fvar_val(v->a);
     return const_head(v->a, v->n.ls);
   }
 
@@ -546,15 +638,18 @@ struct Engine {
   }
 
   Val* eval(Env* env, Expr e) {
-    const ExprNode& n = node(e);
+    const ExprNode n = node(e);
     switch (n.kind) {
       case EKind::BVar: return lookup(env, n.a);
       case EKind::Sort: return mk_sort(inst_level(env->ls, n.a));
       case EKind::Const: KC(k_const); if (!env->ls) return const_head(n.name, n.lvls); break;
       case EKind::Lit: return lit_val(e, n);
-      case EKind::FVar: case EKind::Clos: nfail("unexpected term");
+      case EKind::FVar: return fvar_val(n.a);
+      case EKind::Clos: return eval(env, expand_closures(e));   // a suspended substitution from the term-level interface
       default: break;
     }
+    // A term with a free variable is not cached: variable ids are reused once a scope closes.
+    if (n.flags & 1) return eval_slow(env, e, env, nullptr);
     Env* ke = key_env(env, e);
     KC(k_eval);
     bool created; Val** slotp = c_eval.slot((u64)ke, e, created);
@@ -570,7 +665,7 @@ struct Engine {
 #define ECTX(c) ((void)0)
 #endif
   __attribute__((noinline)) Val* eval_slow(Env* env, Expr e, Env* ke, Val** slotp) {
-    const ExprNode& n = node(e);
+    const ExprNode n = node(e);
     env = ke;
 #ifdef LL_NBE_STATS
     ectx_miss[ectx]++;
@@ -607,7 +702,7 @@ struct Engine {
       case EKind::Proj: r = do_proj(eval(env, n.b), n.name, n.a); break;
       default: nfail("unexpected term");
     }
-    if (c_eval.gen == gen0) *slotp = r; else c_eval.put((u64)ke, e, r);
+    if (slotp) { if (c_eval.gen == gen0) *slotp = r; else c_eval.put((u64)ke, e, r); }
     return r;
   }
 
@@ -782,8 +877,22 @@ struct Engine {
   }
   // one head reduction step (delta, iota, quotient), or nullptr
   Val* step(u32 d, Val* v) {
+    if (v->hk == H_FVAR) {   // a let-bound variable unfolds to its value
+      if (v->n.ls == NIL) return nullptr;
+      if (v->n.red) return v->n.red == STUCK ? nullptr : v->n.red;
+      Val* h = eval(groot, v->n.ls);
+      Val* r = h;
+      if (v->n.sp) { SVec<u64, 16> es; elims(v->n.sp, es); r = apply_elims(h, es, 0, es.size()); }
+      v->n.red = r;
+      return r;
+    }
     if (v->hk != H_DEF && v->hk != H_REC && v->hk != H_QUOT) return nullptr;
     if (v->n.red) return v->n.red == STUCK ? nullptr : v->n.red;
+    if (machine && closed(v)) {   // computation: the lazy machine takes it to weak-head normal form
+      Val* r = machine_whnf(v);
+      v->n.red = r ? r : STUCK;
+      return r;
+    }
     KC(k_step);
     tick();
     Val* r = v->hk == H_DEF ? unfold_nc(d, v) : v->hk == H_REC ? iota_nc(d, v) : quot_nc(d, v);
@@ -798,8 +907,11 @@ struct Engine {
   }
   Val* unfold_nc(u32 d, Val* v) {
     if (is_nat_binop(v->a) && v->n.sp && v->n.sp->len == 2 && !v->n.sp->nproj) {
+      // computed when both operands are numerals; an operand with a bound variable is not
+      // tried (reducing `x + 57343` towards a numeral walks 57343 successors before failing)
+      Val* a = (Val*)v->n.sp->prev->e; Val* b = (Val*)v->n.sp->e;
       mpz_class x, y;
-      if (as_nat(d, (Val*)v->n.sp->prev->e, x) && as_nat(d, (Val*)v->n.sp->e, y)) {
+      if (closed(a) && closed(b) && as_nat(d, a, x) && as_nat(d, b, y)) {
         if (Val* r = nat_binop(v->a, x, y)) return r;
       }
     }
@@ -895,12 +1007,12 @@ struct Engine {
       case V_LAM: return mk_pi(lam_dom(v), v->lam.env, v->lam.body, true);
       default: break;
     }
-    if (v->hk == H_BVAR && !v->n.sp) return v->n.bty;
+    if ((v->hk == H_BVAR || v->hk == H_FVAR) && !v->n.sp) return v->n.bty;
     KC(k_vtype);
     if (Val** c = c_vtype.find((u64)v, 5)) { KC(k_vtype_hit); return *c; }
     Guard g(*this);
     Val* head = head_of(v);
-    Val* t = v->hk == H_BVAR ? v->n.bty : const_type(v->a, v->n.ls);
+    Val* t = (v->hk == H_BVAR || v->hk == H_FVAR) ? v->n.bty : const_type(v->a, v->n.ls);
     SVec<u64, 16> es; elims(v->n.sp, es);
     bool track = v->n.sp && v->n.sp->nproj;
     Val* cur = head;
@@ -941,7 +1053,7 @@ struct Engine {
     if (Val** p = c_type.find(HI | n, ls)) return *p;
     ECTX(4);
     const ConstInfo* c = E->find(n);
-    if (!c) nfail("unknown constant");
+    if (!c) nfail_unknown(n);
     Val* t = eval_inst(c->type, *c, ls);
     c_type.put(HI | n, ls, t);
     return t;
@@ -1093,7 +1205,7 @@ struct Engine {
   // 1: statically a proof, 0: statically not a proof, -1: unknown
   int static_proof(Val* v) {
     static const bool off = getenv("LL_NBE_NOSTATIC") != nullptr;
-    if (off || v->k != V_NEU || v->hk == H_BVAR) return -1;
+    if (off || v->k != V_NEU || v->hk == H_BVAR || v->hk == H_FVAR) return -1;
     Spine* sp = v->n.sp;
     if (sp && sp->nproj) return -1;
     u32 k = sp ? sp->len : 0;
@@ -1102,7 +1214,8 @@ struct Engine {
     if (!((sg->res_known >> k) & 1)) return -1;
     return (sg->res_prop >> k) & 1;
   }
-  static bool reducible(Val* v) { return v->k == V_NEU && (v->hk == H_DEF || v->hk == H_REC || v->hk == H_QUOT); }
+  static bool reducible(Val* v) { return v->k == V_NEU && (v->hk == H_DEF || v->hk == H_REC || v->hk == H_QUOT || (v->hk == H_FVAR && v->n.ls != NIL)); }
+  static bool let_var(Val* v) { return v->k == V_NEU && v->hk == H_FVAR && v->n.ls != NIL; }
 
   bool conv(u32 d, Val* x, Val* y) {
     if (x == y) return true;
@@ -1140,7 +1253,7 @@ struct Engine {
   }
   bool same_head(Val* x, Val* y) {
     if (x->hk != y->hk || x->a != y->a) return false;
-    if (x->hk == H_BVAR) return true;
+    if (x->hk == H_BVAR || x->hk == H_FVAR) return true;
     return levels_eq(x->n.ls, y->n.ls);
   }
   // Compare two spines of the same head.  `skip` marks argument positions holding proofs
@@ -1162,7 +1275,7 @@ struct Engine {
   }
   u64 skip_mask(Val* x) {
     static const bool off = getenv("LL_NBE_NOSKIP") != nullptr;
-    if (off || x->k != V_NEU || x->hk == H_BVAR) return 0;
+    if (off || x->k != V_NEU || x->hk == H_BVAR || x->hk == H_FVAR) return 0;
     return sig_of(x->a, x->n.ls)->arg_prop;
   }
   bool probe_spine(u32 d, Spine* a, Spine* b, u64 skip) {
@@ -1207,6 +1320,8 @@ struct Engine {
     return conv_cold(d, x, y);
   }
   bool conv_delta(u32 d, Val* x, Val* y) {
+    if (let_var(x)) return conv(d, step(d, x), y);
+    if (let_var(y)) return conv(d, x, step(d, y));
     bool same = x->k == V_NEU && y->k == V_NEU && same_head(x, y);
     if (same && probe_spine(d, x->n.sp, y->n.sp, skip_mask(x))) return true;
     int pi = proof_irrel(d, x, y);
@@ -1294,7 +1409,7 @@ struct Engine {
   }
 
   Val* infer(bool chk, Env* env, u32 d, Expr e) {
-    const ExprNode& n = node(e);
+    const ExprNode n = node(e);
     switch (n.kind) {
       case EKind::BVar: return value_type(d, lookup(env, n.a));
       case EKind::Sort:
@@ -1302,12 +1417,12 @@ struct Engine {
         return mk_sort(mk_succ(inst_level(env->ls, n.a)));
       case EKind::Const: {
         const ConstInfo* c = E->find(n.name);
-        if (!c) nfail("unknown constant");
+        if (!c) nfail_unknown(n.name);
         LevelList ls = inst_levels(env->ls, n.lvls);
         if (g_levels->list_size(ls) != c->lparams.size()) nfail("wrong number of universe levels");
         if (chk) {
-          if (c->is_unsafe) nfail("unsafe constant");
-          if (c->kind == CKind::Def && c->safety == Safety::Partial) nfail("partial constant");
+          if (c->is_unsafe && safety != Safety::Unsafe) nfail("invalid declaration, it uses an unsafe declaration");
+          if (c->kind == CKind::Def && c->safety == Safety::Partial && safety == Safety::Safe) nfail("invalid declaration, a safe declaration must not use a partial declaration");
           for (Level l : g_levels->list_ref(n.lvls)) check_level(l);
         }
         return const_type(n.name, ls);
@@ -1316,17 +1431,19 @@ struct Engine {
         if (n.b == (u32)LitKind::Nat) { if (!E->find(N.Nat)) nfail("no Nat"); return const_head(N.Nat, 0); }
         if (!E->find(N.String) || !E->find(N.Char_ofNat) || !E->find(N.String_ofList)) nfail("no String");
         return const_head(N.String, 0);
-      case EKind::FVar: case EKind::Clos: nfail("unexpected term");
+      case EKind::FVar: return fvar_val(n.a)->n.bty;
+      case EKind::Clos: return infer(chk, env, d, expand_closures(e));
       default: break;
     }
+    if (n.flags & 1) return infer_slow(chk, env, d, e, env, false);
     Env* ke = key_env(env, e);
     IEnt* ce = c_infer.find((u64)ke, e);
     KC(k_infer);
     if (ce && (!chk || ce->scope == scope)) { KC(k_infer_hit); return ce->ty; }
-    return infer_slow(chk, env, d, e, ke);
+    return infer_slow(chk, env, d, e, ke, true);
   }
-  __attribute__((noinline)) Val* infer_slow(bool chk, Env* env, u32 d, Expr e, Env* ke) {
-    const ExprNode& n = node(e);
+  __attribute__((noinline)) Val* infer_slow(bool chk, Env* env, u32 d, Expr e, Env* ke, bool cache) {
+    const ExprNode n = node(e);
     env = ke;
     IEnt* ce;
     Guard g(*this);
@@ -1347,7 +1464,7 @@ struct Engine {
         for (size_t i = 0; i < args.size(); i++) {
           Val* dom; Expr body; Env* benv; bool pinf = false;
           if (tenv) {
-            const ExprNode& pn = node(texpr);
+            const ExprNode pn = node(texpr);
             body = pn.b; benv = tenv;
             { ECTX(8); dom = chk ? eval(tenv, pn.a) : nullptr; }
           } else {
@@ -1404,65 +1521,283 @@ struct Engine {
       }
       default: nfail("unexpected term");
     }
-    ce = c_infer.find((u64)ke, e);
-    if (!ce || chk) c_infer.put((u64)ke, e, IEnt{r, chk ? scope : 0u});
+    if (cache) {
+      ce = c_infer.find((u64)ke, e);
+      if (!ce || chk) c_infer.put((u64)ke, e, IEnt{r, chk ? scope : 0u});
+    }
     return r;
   }
 
   // ---------------------------------------------------------------- declarations
 
+  // ---------------------------------------------------------------- readback
+
+  // v mentions no bound variable (free variables of the local context are fine)
+  PMap<u8> c_closed;
+  bool closed(Val* v) {
+    switch (v->k) {
+      case V_SORT: case V_NAT: case V_STR: return true;
+      default: break;
+    }
+    if (v->k == V_NEU && v->hk == H_BVAR) return false;
+    if (u8* c = c_closed.find((u64)v, 8)) return *c;
+    bool r = true;
+    if (v->k == V_NEU) {
+      for (Spine* sp = v->n.sp; sp && r; sp = sp->prev) if (!is_proj_elim(sp->e) && !closed((Val*)sp->e)) r = false;
+    } else {
+      Env* e = v->k == V_LAM ? v->lam.env : v->pi.env;
+      if (v->k == V_PI && v->pi.dom && !closed(v->pi.dom)) r = false;
+      r = r && env_closed(e);
+    }
+    c_closed.put((u64)v, 8, r);
+    return r;
+  }
+  bool env_closed(Env* e) {
+    for (; e; e = e->frame ? nullptr : e->parent) {
+      if (e->frame) { Val** sl = (Val**)e->v; for (int i = 0, k = __builtin_popcountll(e->mask); i < k; i++) if (!closed(sl[i])) return false; break; }
+      if (e->v && !closed(e->v)) return false;
+    }
+    return true;
+  }
+  // The term a value denotes, at binder depth d (a bound variable of level l is index d-1-l).
+  Expr quote(u32 d, Val* v) {
+    Guard g(*this);
+    switch (v->k) {
+      case V_SORT: return ll::mk_sort(v->a);
+      case V_NAT: return ll::mk_nat_lit(mpz_class(*v->nat.v));
+      case V_STR: { std::string str = g_exprs->str_lits[v->a]; return ll::mk_str_lit(str); }
+      case V_LAM: {
+        Val* dom = lam_dom(v); Expr de = quote(d, dom);
+        Expr b = quote(d + 1, apply(v, fresh(d, dom)));
+        return ll::mk_lam(N.anonymous, de, b, BInfo::Default);
+      }
+      case V_PI: {
+        Val* dom = pi_dom(v); Expr de = quote(d, dom);
+        Expr b = quote(d + 1, inst_pi(d + 1, v, fresh(d, dom)));
+        return ll::mk_pi(N.anonymous, de, b, BInfo::Default);
+      }
+      default: break;
+    }
+    Expr h;
+    if (v->hk == H_BVAR) { if (v->a >= d) nfail("readback of a variable out of scope"); h = ll::mk_bvar(d - 1 - v->a); }
+    else if (v->hk == H_FVAR) h = ll::mk_fvar(v->a);
+    else h = ll::mk_const(v->a, v->n.ls);
+    SVec<u64, 16> es; elims(v->n.sp, es);
+    for (size_t i = 0; i < es.size(); i++)
+      h = is_proj_elim(es[i]) ? ll::mk_proj(proj_name(es[i]), proj_idx(es[i]), h) : ll::mk_app(h, quote(d, (Val*)es[i]));
+    return h;
+  }
+  // A closed value taken to weak-head normal form by the lazy machine (nullptr: already one).
+  Val* machine_whnf(Val* v) {
+    Expr q = quote(0, v);
+    // fused first, as the machine unfolds definitions (fusion may itself reduce the term)
+    Expr e = g_fuse ? fuse_term(*E, mctx->fuse_cache, q) : q;
+    Machine m(*mctx);
+    Expr r = m.whnf(e, true);
+    if (r == q) return nullptr;
+    return eval(groot, expand_closures(r));
+  }
+
+  // ---------------------------------------------------------------- checking a constant
+
+  u32 scope_of(const std::vector<Name>& ps, Safety sf) {
+    std::vector<Level> ls; for (Name n : ps) ls.push_back(mk_param(n));
+    return (g_levels->mk_list(ls) + 2) * 4 + (u32)sf;   // an inference checked under these parameters and safety
+  }
+  void begin(const Environment& env, const std::vector<Name>* lps, Safety sf, bool mach, u64 bud, size_t arena_bud) {
+    if (!groot) start_session();
+    E = &env;
+    fvm_n = g_exprs->wm_nodes ? g_exprs->wm_nodes : g_exprs->nodes.size();
+    lparams = lps; safety = sf; scope = scope_of(*lps, sf);
+    steps = 0; budget = bud; depth = 0; arena0 = ar.bytes; decl_arena = arena_bud; probing = false; exhausted = false;
+    machine = mach; in_check = true;
+    if (mach && !mctx) mctx = new MachineCtx(env, *lps);
+  }
+  void end() {
+    in_check = false; machine = false; probing = false; exhausted = false; depth = 0;
+    delete mctx; mctx = nullptr;
+  }
+  // The type of c is a sort (Prop for a theorem), and its value, if checked, has that type.
+  void check_const(const ConstInfo& c, bool thm, bool with_value) {
+    Val* s = whnf(0, phase_type(c.type));
+    if (s->k != V_SORT) nfail("type expected");
+    if (thm && !lvl_zero(s->a)) nfail("theorem type is not a proposition");
+    if (with_value && c.value != NIL) {
+      Val* vt = phase_value(c.value);
+      if (!phase_conv(vt, c.type)) nfail("declaration type mismatch");
+    }
+  }
+
   // the three phases of checking a definition (separate functions, for profiles)
   __attribute__((noinline)) Val* phase_type(Expr t) { return infer(true, groot, 0, t); }
   __attribute__((noinline)) Val* phase_value(Expr v) { return infer(true, groot, 0, v); }
   __attribute__((noinline)) bool phase_conv(Val* vt, Expr t) { Val* tv; { ECTX(11); tv = eval(groot, t); } return conv_types(0, vt, tv); }
-  bool check(const Environment& env, const Decl& dcl) {
-    if (dcl.kind != Decl::Axiom && dcl.kind != Decl::Def && dcl.kind != Decl::Thm && dcl.kind != Decl::Opaque) return false;
-    const ConstInfo& c = dcl.consts[0];
-    if (c.is_unsafe || (c.kind == CKind::Def && c.safety != Safety::Safe)) return false;
-    if (has_loose_bvars(c.type) || has_fvar(c.type)) return false;
-    if (c.value != NIL && (has_loose_bvars(c.value) || has_fvar(c.value))) return false;
-    if (dcl.kind != Decl::Axiom && c.value == NIL) return false;
-    for (size_t i = 0; i < c.lparams.size(); i++) for (size_t j = i + 1; j < c.lparams.size(); j++) if (c.lparams[i] == c.lparams[j]) return false;
-    if (env.contains(c.name)) return false;
-    if (!groot) start_session();
-    E = &env;
-    g_nodes = g_exprs->nodes.data();
-    fvm_n = g_exprs->wm_nodes ? g_exprs->wm_nodes : g_exprs->nodes.size();
-    lparams = &c.lparams;
-    scope = plist_of(c) + 2;   // an inference checked under these universe parameters
-    steps = 0; budget = g_nbe_budget; depth = 0; arena0 = ar.bytes; probing = false; exhausted = false;
-    try {
-      Val* s = whnf(0, phase_type(c.type));
-      if (s->k != V_SORT) nfail("type expected");
-      if (dcl.kind == Decl::Thm && !lvl_zero(s->a)) nfail("theorem type is not a proposition");
-      if (c.value != NIL) {
-        Val* vt = phase_value(c.value);
-        if (!phase_conv(vt, c.type)) nfail("type mismatch");
-      }
-    } catch (NbeFail& f) {
-      static const bool trace = getenv("LL_NBE_TRACE") != nullptr;
-      if (trace) std::cerr << "nbe declined " << name_str(c.name) << ": " << f.why << "\n";
-      s_steps += steps; s_decline++; note_reason(f.why);
-      probing = false; exhausted = false; depth = 0;
-      return false;
-    }
-    { static const bool mr = getenv("LL_MEMREPORT") != nullptr;
-      if (mr && ar.bytes > arena0 + ((size_t)64 << 20)) std::cerr << "nbe: " << name_str(c.name) << " allocated " << ((ar.bytes - arena0) >> 20) << " MB, " << steps << " steps\n"; }
-    s_steps += steps; s_accept++;
-    { u64 b = 0, x = steps; while (x >= 1000 && b < 7) { x /= 10; b++; } s_hist[b]++; }
-    return true;
-  }
 };
 
-Engine* g_engine_nbe = nullptr;
+Engine* g_engine_nbe = nullptr;   // the main session: declarations that do not compute
+Engine* g_scratch = nullptr;      // declarations that need terms of their own, and those that compute
 size_t g_session_bytes = getenv("LL_NBE_SESSION_MB") ? (size_t)atol(getenv("LL_NBE_SESSION_MB")) << 20 : (size_t)128 << 20;
 bool g_session_fixed = getenv("LL_NBE_SESSION_MB") != nullptr;
 
 } // namespace
 
-bool nbe_check(const Environment& env, const Decl& d) {
-  if (!g_engine_nbe) g_engine_nbe = new Engine();
-  return g_engine_nbe->check(env, d);
+namespace {
+Engine& main_engine() { if (!g_engine_nbe) g_engine_nbe = new Engine(); return *g_engine_nbe; }
+Engine& scratch() { if (!g_scratch) { g_scratch = new Engine(); g_scratch->scratch_session = true; } return *g_scratch; }
+
+// The term-level interface runs on the scratch session under the caller's universe parameters
+// and safety, and restores whatever check the session was in the middle of.
+struct Facade {
+  Engine& g;
+  const Environment* E0; const std::vector<Name>* lp0; Safety sf0; u32 scope0; u64 budget0;
+  explicit Facade(const Kernel& k) : g(scratch()), E0(g.E), lp0(g.lparams), sf0(g.safety), scope0(g.scope), budget0(g.budget) {
+    if (!g.groot) g.start_session();
+    g.E = &k.env; g.lparams = &k.lparams; g.safety = k.safety; g.scope = g.scope_of(k.lparams, k.safety);
+    g.fvm_n = g_exprs->wm_nodes ? g_exprs->wm_nodes : g_exprs->nodes.size();
+    if (!g.in_check) { g.steps = 0; g.budget = ~0ull >> 8; g.arena0 = g.ar.bytes; g.decl_arena = ~(size_t)0 >> 8; }
+  }
+  ~Facade() { g.E = E0; g.lparams = lp0; g.safety = sf0; g.scope = scope0; if (!g.in_check) g.budget = budget0; }
+};
+template <class F> auto kguard(F f) -> decltype(f()) {
+  try { return f(); } catch (NbeFail& e) { fail(std::string("(kernel) ") + e.why); }
+}
+} // namespace
+
+Expr Kernel::whnf(Expr e) { Facade F(*this); return kguard([&] { return F.g.quote(0, F.g.whnf(0, F.g.eval(F.g.groot, e))); }); }
+// Head reduction only (beta, let, projection, iota), by the machine: the rest of the term is left
+// as it is, its `let`s included (fix.cpp builds rules from it, and they share through those).
+Expr Kernel::whnf_core(Expr e) {
+  MachineCtx mc(env, lparams);
+  Machine m(mc);
+  return expand_closures(m.whnf(e, false));
+}
+Expr Kernel::infer_type(Expr e) { Facade F(*this); return kguard([&] { return F.g.quote(0, F.g.infer(false, F.g.groot, 0, e)); }); }
+Expr Kernel::check_type(Expr e) { Facade F(*this); return kguard([&] { return F.g.quote(0, F.g.infer(true, F.g.groot, 0, e)); }); }
+bool Kernel::is_def_eq(Expr a, Expr b) {
+  Facade F(*this);
+  return kguard([&] { return F.g.conv_types(0, F.g.eval(F.g.groot, a), F.g.eval(F.g.groot, b)); });
+}
+Expr Kernel::ensure_sort(Expr t, Expr of) {
+  Facade F(*this);
+  return kguard([&] {
+    Val* v = F.g.whnf(0, F.g.eval(F.g.groot, t));
+    if (v->k != V_SORT) fail("type expected: " + expr_str(of).substr(0, 300));
+    return mk_sort(v->a);
+  });
+}
+Expr Kernel::ensure_pi(Expr t, Expr of) {
+  Facade F(*this);
+  return kguard([&] {
+    Val* v = F.g.whnf(0, F.g.eval(F.g.groot, t));
+    if (v->k != V_PI) fail("function expected: " + expr_str(of).substr(0, 300));
+    return F.g.quote(0, v);
+  });
+}
+bool Kernel::is_prop(Expr t) { Facade F(*this); return kguard([&] { return F.g.is_prop_type(0, F.g.eval(F.g.groot, t)); }); }
+
+// A K-like recursor's major premise, replaced by the constructor its type forces.
+Expr Kernel::to_ctor_when_K(const ConstInfo& rec, Expr e) {
+  Expr app_type = whnf(infer_type(e));
+  Expr I = get_app_fn(app_type);
+  if (!is_const(I) || const_name(I) != rec.major_induct) return e;
+  std::vector<Expr> args; get_app_args(app_type, args);
+  const ConstInfo* ind = env.find(const_name(I));
+  if (!ind || ind->ctors.empty() || args.size() < rec.nparams) return e;
+  Expr ctor = mk_apps_range(mk_const(ind->ctors[0], const_levels(I)), args, 0, rec.nparams);
+  if (!is_def_eq(app_type, infer_type(ctor))) return e;
+  return ctor;
+}
+// A structure's major premise, eta-expanded into its constructor applied to its projections.
+Expr Kernel::to_ctor_when_struct(Name induct, Expr e) {
+  if (!env.is_structure_like(induct)) return e;
+  Expr f = get_app_fn(e);
+  if (is_const(f)) { const ConstInfo* c = env.find(const_name(f)); if (c && c->kind == CKind::Ctor) return e; }
+  Expr etype = whnf(infer_type(e));
+  Expr I = get_app_fn(etype);
+  if (!is_const(I) || const_name(I) != induct) return e;
+  if (is_prop(etype)) return e;
+  std::vector<Expr> args; get_app_args(etype, args);
+  const ConstInfo& ind = env.get(induct);
+  const ConstInfo& ctor = env.get(ind.ctors[0]);
+  if (args.size() < ctor.nparams) return e;
+  Expr r = mk_apps_range(mk_const(ctor.name, const_levels(I)), args, 0, ctor.nparams);
+  for (u32 i = 0; i < ctor.nfields; i++) r = mk_app(r, mk_proj(induct, i, e));
+  return r;
+}
+
+// The environment lost constants (an inductive block's auxiliary types are rolled back): the
+// scratch session may hold values of them, so it starts over.
+void kernel_env_rolled_back() {
+  Engine& S = scratch();
+  if (S.groot) S.start_session(false);
+}
+
+// Every declaration comes here.  Definitions, theorems, axioms and opaque constants that do not
+// compute are checked in the main session; one that runs past its budget there (it computes),
+// and one that needs terms of its own (inductive types, quotients, unsafe and partial
+// definitions), is checked in the scratch session, where closed terms are reduced by the lazy
+// machine, and the scratch session is emptied afterwards.  Either way it is the same checker.
+void check_decl(Environment& env, Decl& d) {
+  for (const ConstInfo& c : d.consts) {
+    if (d.kind == Decl::Quot) break;   // the kernel defines the quotient constants; the export's terms are not used
+    if (has_loose_bvars(c.type) || (c.value != NIL && has_loose_bvars(c.value))) fail("declaration '" + name_str(c.name) + "' has loose bound variables");
+    for (const RecRule& r : c.rules) if (has_loose_bvars(r.rhs)) fail("recursor rule of '" + name_str(c.name) + "' has loose bound variables");
+  }
+  Engine& S = scratch();
+  struct Done { Engine& S; ~Done() { S.end(); S.start_session(false); } };
+  if (d.kind == Decl::Quot || d.kind == Decl::Inductive) {
+    Done done{S};
+    if (d.kind == Decl::Quot) add_quot_decl(env, d); else add_inductive_decl(env, d, false);
+    return;
+  }
+  const ConstInfo& c = d.consts[0];
+  if (env.contains(c.name)) fail("constant already declared: " + name_str(c.name));
+  check_dup_lparams(c.lparams);
+  if (has_fvar(c.type) || (c.value != NIL && has_fvar(c.value))) fail("declaration '" + name_str(c.name) + "' has free variables");
+  if (d.kind != Decl::Axiom && c.value == NIL) fail("declaration '" + name_str(c.name) + "' has no value");
+  const Safety sf = c.is_unsafe ? Safety::Unsafe : (c.kind == CKind::Def ? c.safety : Safety::Safe);
+  const bool thm = d.kind == Decl::Thm, recursive = d.kind == Decl::Def && sf != Safety::Safe;
+  if (!recursive) {
+    Engine& M = main_engine();
+    M.begin(env, &c.lparams, sf, false, g_nbe_budget, g_decl_arena);
+    try {
+      M.check_const(c, thm, true);
+      M.end();
+      s_steps += M.steps; s_accept++;
+      { u64 b = 0, x = M.steps; while (x >= 1000 && b < 7) { x /= 10; b++; } s_hist[b]++; }
+      env.add(std::move(d.consts[0]));
+      return;
+    } catch (NbeFail& f) {
+      static const bool trace = getenv("LL_NBE_TRACE") != nullptr;
+      if (trace) std::cerr << "main session gave " << name_str(c.name) << " to the scratch session: " << f.why << "\n";
+      s_steps += M.steps; s_decline++; note_reason(f.why);
+      M.end();
+    }
+  }
+  {
+    Done done{S};
+    S.begin(env, &c.lparams, sf, true, (u64)4 << 30, ~(size_t)0 >> 8);
+    try {
+      if (recursive) {
+        // unsafe or partial: the header first, then the value with the constant in scope as an
+        // (unsafe) axiom, as the kernel checks such definitions
+        S.check_const(c, false, false);
+        ConstInfo ax = c; ax.kind = CKind::Axiom; ax.is_unsafe = true; ax.value = NIL;
+        size_t m = env.mark();
+        env.add(ax);
+        try {
+          Val* vt = S.phase_value(c.value);
+          if (!S.phase_conv(vt, c.type)) nfail("declaration type mismatch");
+        } catch (...) { env.rollback(m); throw; }
+        env.rollback(m);
+      } else S.check_const(c, thm, true);
+      static const bool trace = getenv("LL_NBE_TRACE") != nullptr;
+      if (trace) std::cerr << "scratch session checked " << name_str(c.name) << ": " << S.steps << " steps, arena " << (S.ar.bytes >> 20) << " MB\n";
+    } catch (NbeFail& f) {
+      fail(std::string("(kernel) ") + f.why + " in '" + name_str(c.name) + "'");
+    }
+  }
+  env.add(std::move(d.consts[0]));
 }
 
 // A session's size follows the export's: about a 44th of the file, between 32 and 128 MB.  A
@@ -1491,6 +1826,7 @@ void nbe_report() {
               << " sig " << (g.c_sig.t ? cap(g.c_sig.mask, 24) : 0) << "+" << (g.c_sig.n * 48 >> 20) << " norm " << (g.p_norm.t ? cap(g.p_norm.mask, 24) : 0)
               << " var0 " << (g.p_var0.t ? cap(g.p_var0.mask, 24) : 0) << " nats " << g.nats.size() << "; total " << (t >> 20)
               << " MB; arena blocks " << (g.ar.blocks.size() * Arena::BLOCK >> 20) << " MB\n";
+    std::cerr << "wide variable sets: " << g_wide_sets.size() << " bytes\n";
     std::cerr << "expr nodes " << g_exprs->nodes.size() << " x " << sizeof(ExprNode) << " B (capacity " << (g_exprs->nodes.capacity() * sizeof(ExprNode) >> 20) << " MB)\n";
   }
   std::cerr << "nbe: " << s_accept << " accepted, " << s_decline << " declined; " << s_steps << " steps; " << s_sessions << " sessions\n";

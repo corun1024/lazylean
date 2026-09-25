@@ -5,7 +5,7 @@
 // to it sees the result (call by need).  Memory is reference counted; the structures are acyclic
 // by construction (a thunk can only refer to thunks created before it).
 #pragma once
-#include "tc.h"
+#include "kernel.h"
 #include <unordered_map>
 
 namespace ll {
@@ -89,9 +89,9 @@ struct ClosedThunkMap {
   }
 };
 struct Machine {
-  TypeChecker& tc;
+  MachineCtx& tc;
   u64 steps = 0;
-  Machine(TypeChecker& t) : tc(t) {}
+  Machine(MachineCtx& t) : tc(t) {}
 
   // Weak-head normalise `e` (a term with no loose bvars); `delta` allows unfolding definitions.
   Expr whnf(Expr e, bool delta, bool cheap_proj = false);

@@ -9,7 +9,7 @@ namespace ll {
 ExprTable* g_exprs = nullptr;
 void clear_sem_memos();   // below: handles and env ids are recycled by reclaim(), so the memos must not outlive it
 u64 g_cnt_clos = 0, g_cnt_clos_compose = 0, g_cnt_clos_expand = 0, g_cnt_expose = 0, g_cnt_env = 0;
-void check_rss(const char* where);   // tc.cpp
+void check_rss(const char* where);   // kernel.cpp
 
 ExprTable::ExprTable() {
   nodes.reserve(1 << 20);
@@ -32,12 +32,14 @@ void ExprTable::reserve_permanent(size_t n, bool size_table) {
     nodes.reserve(cap);
     advise_huge(nodes.data(), cap * sizeof(ExprNode));
   } else nodes.reserve(cap);
+  g_node_base = nodes.data();
   if (size_table) table->reserve(n);
 }
 
 // Look up `cand` (already appended) in the permanent table without inserting.
 template <class T> static u32 find_only(T* t, u32 cand) { return t->find(cand); }
 
+const ExprNode* g_node_base = nullptr;
 u64 g_int_perm_probe = 0, g_int_perm_hit = 0, g_int_temp_hit = 0, g_int_new = 0;
 u64 g_int_kind[16];
 #ifdef LL_INTERN_STATS
@@ -50,6 +52,7 @@ Expr ExprTable::intern(ExprNode nd) {
   const bool temp_hint = nd.flags & 0x80;
   nd.flags &= 0x7f;
   nodes.push_back(nd);
+  g_node_base = nodes.data();
   if ((nodes.size() & 0xfffff) == 0) check_rss("intern");
   if (bulk) return (u32)nodes.size() - 1;   // indexed later by build_index()
   u32 cand = (u32)nodes.size() - 1;
@@ -141,7 +144,7 @@ void ExprTable::reset_permanent() {
 void ExprTable::freeze() { frozen = true; wm_nodes = nodes.size(); wm_nat = nat_lits.size(); wm_str = str_lits.size(); }
 void ExprTable::reclaim() {
   if (!frozen) return;
-  nodes.resize(wm_nodes); nat_lits.resize(wm_nat); str_lits.resize(wm_str);
+  nodes.resize(wm_nodes); g_node_base = nodes.data(); nat_lits.resize(wm_nat); str_lits.resize(wm_str);
   // Clearing a table costs its capacity, so an untouched table is left alone and an oversized
   // one is shrunk rather than wiped in place (a declaration that interned little pays little).
   auto reset = [](auto* t, size_t small) {
@@ -159,7 +162,7 @@ void ExprTable::reclaim() {
 
 void ExprTable::trim() {
   reclaim();
-  nodes.shrink_to_fit(); nat_lits.shrink_to_fit(); str_lits.shrink_to_fit();
+  nodes.shrink_to_fit(); g_node_base = nodes.data(); nat_lits.shrink_to_fit(); str_lits.shrink_to_fit();
   envs.shrink_to_fit(); env_hash.shrink_to_fit(); env_flags.shrink_to_fit();
   for (auto* t : {ttable}) { t->slots.assign(1u << 16, t->EMPTY); t->slots.shrink_to_fit(); t->count = 0; t->dirty.clear(); t->dirty.shrink_to_fit(); }
   tntable->slots.assign(1u << 12, tntable->EMPTY); tntable->slots.shrink_to_fit(); tntable->count = 0; tntable->dirty.clear();
@@ -231,12 +234,14 @@ Expr bulk_app(Expr f, Expr a) {
   const u32 lbr = std::max(nd[f].loose_bvar_range, nd[a].loose_bvar_range);
   const u32 h = hk(EKind::App, mix(nd[f].hash, nd[a].hash));
   T.nodes.push_back(ExprNode{EKind::App, BInfo::Default, fl, lbr, f, a, 0, 0, 0, h});
+  g_node_base = T.nodes.data();
   return (u32)T.nodes.size() - 1;
 }
 Expr bulk_binding(bool pi, Name n, Expr dom, Expr body, BInfo bi) {
   ExprTable& T = *g_exprs;
   if (!T.bulk) return pi ? mk_pi(n, dom, body, bi) : mk_lam(n, dom, body, bi);
   T.nodes.push_back(node_binding(pi ? EKind::Pi : EKind::Lam, n, dom, body, bi));
+  g_node_base = T.nodes.data();
   return (u32)T.nodes.size() - 1;
 }
 static Expr mk_binding(EKind k, Name n, Expr dom, Expr body, BInfo bi) { return g_exprs->intern(node_binding(k, n, dom, body, bi)); }

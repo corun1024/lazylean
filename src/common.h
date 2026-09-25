@@ -135,7 +135,7 @@ struct InternTable {
   // handle, so a probe only touches the element (a random access into the node table) when the
   // tag matches.  A Compact table stores the bare handle (4 bytes a slot, half the memory), and
   // every probe of an occupied slot compares the element: for the permanent expression index,
-  // which after loading is probed only when the reference checker builds a term.
+  // which after loading is probed only when the kernel builds a term.
   using Slot = std::conditional_t<Compact, u32, u64>;
   static constexpr Slot EMPTY = (Slot)~(Slot)0;
   std::vector<Slot> slots;

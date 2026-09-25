@@ -6,7 +6,7 @@
 // *derived* (elimination universe, K-target, motives, minors, rules).  The derived recursors,
 // restored to the nested form, must be definitionally equal to the exported ones; any recursor the
 // export contains that we did not derive is rejected.
-#include "tc.h"
+#include "kernel.h"
 #include <iostream>
 #include <map>
 
@@ -259,7 +259,7 @@ struct AddInductive {
   std::vector<Expr> ind_consts;
   std::vector<Name> ind_names;
 
-  TypeChecker tc;
+  Kernel tc;
   AddInductive(Environment& e, const std::vector<Name>& lps, u32 np, std::vector<Expr> ps, std::vector<IndType>& ts, Safety s)
     : env(e), lparams(lps), nparams(np), params(std::move(ps)), types(ts), sf(s), is_unsafe(s == Safety::Unsafe), tc(e, lps, s) {
     for (Name p : lparams) lvls.push_back(mk_param(p));
@@ -520,7 +520,7 @@ void add_inductive_decl(Environment& env, const Decl& d, bool /*trust*/) {
     auto has_nested_prefix = [&](Name n) { for (Name x = n; x != 0; x = (*g_names)[x].parent) if (x == nested_prefix) return true; return false; };
     std::vector<IndType> orig;
     {
-      TypeChecker tc(env, lparams, sf);
+      Kernel tc(env, lparams, sf);
       for (size_t i = 0; i < d.ntypes; i++) {
         const ConstInfo& c = d.consts[i];
         if (c.lparams != lparams) fail("mutually inductive types must have the same universe parameters");
@@ -656,6 +656,7 @@ void add_inductive_decl(Environment& env, const Decl& d, bool /*trust*/) {
     // For comparison we need an environment where the *original* constants are the real ones:
     // roll back to the mark and add the exported types and constructors.
     env.rollback(mark);
+    kernel_env_rolled_back();
     // The types go in with the metadata derived here, not the exported one: the export's
     // numIndices, isRec, isReflexive and numNested were only cross-checked above, and the
     // conversion checker relies on them (structure-likeness, projections, K), as Lean's kernel
@@ -675,7 +676,7 @@ void add_inductive_decl(Environment& env, const Decl& d, bool /*trust*/) {
         fail("recursor '" + name_str(dc.name) + "': parameter/index/motive/minor/K data differs from the derived recursor");
       if (ec->all != dc.all) fail("recursor '" + name_str(dc.name) + "': 'all' differs");
       if (ec->rules.size() != dc.rules.size()) fail("recursor '" + name_str(dc.name) + "': rule count differs");
-      TypeChecker tc(env, dc.lparams, sf);
+      Kernel tc(env, dc.lparams, sf);
       tc.ensure_sort(tc.check_type(dc.type), dc.type);
       if (!tc.is_def_eq(ec->type, dc.type)) fail("recursor '" + name_str(dc.name) + "': exported type differs from the derived type\n  exported: " + expr_str(ec->type) + "\n  derived:  " + expr_str(dc.type));
       for (size_t r = 0; r < dc.rules.size(); r++) {
@@ -754,12 +755,12 @@ void add_quot_decl(Environment& env, const Decl& d) {
     // Eq.{u} : {α : Sort u} → α → α → Prop, and Eq.refl : ∀ {α} (a : α), Eq a a
     Level eu = mk_param(eq.lparams[0]);
     Expr eqTy = mk_pi(mk_name("α"), Sort(eu), mk_pi(N.anonymous, mk_bvar(0), mk_pi(N.anonymous, mk_bvar(1), Sort(LZERO), BInfo::Default), BInfo::Default), BInfo::Implicit);
-    TypeChecker tc0(env, eq.lparams);
+    Kernel tc0(env, eq.lparams);
     if (!tc0.is_def_eq(eqTy, eq.type)) fail("Quot: 'Eq' has an unexpected type");
     const ConstInfo& rf = env.get(eq.ctors[0]);
     Expr reflTy = mk_pi(mk_name("α"), Sort(eu), mk_pi(mk_name("a"), mk_bvar(0),
                     mk_app(mk_app(mk_app(mk_const(N.Eq, g_levels->mk_list({eu})), mk_bvar(1)), mk_bvar(0)), mk_bvar(0)), BInfo::Default), BInfo::Implicit);
-    TypeChecker tc1(env, rf.lparams);
+    Kernel tc1(env, rf.lparams);
     if (rf.lparams.size() != 1 || !tc1.is_def_eq(reflTy, rf.type)) fail("Quot: 'Eq.refl' has an unexpected type");
   }
   // The kernel defines the quotient constants itself and ignores what an export says about
@@ -770,7 +771,7 @@ void add_quot_decl(Environment& env, const Decl& d) {
   if (ok) {
     std::vector<Level> theirs; for (Name p : c.lparams) theirs.push_back(mk_param(p));
     Expr exp2 = instantiate_lparams(expected, lps, theirs);
-    if (!has_loose_bvars(c.type)) { TypeChecker tc(env, c.lparams); ok = tc.is_def_eq(exp2, c.type); } else ok = false;
+    if (!has_loose_bvars(c.type)) { Kernel tc(env, c.lparams); ok = tc.is_def_eq(exp2, c.type); } else ok = false;
     if (ok) added.type = exp2;
   }
   if (!ok) { meta_mismatch("Quot constant '" + name_str(c.name) + "' is exported with an unexpected type; using the built-in one"); added.type = expected; added.lparams = lps; }

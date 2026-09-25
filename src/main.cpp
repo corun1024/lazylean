@@ -1,4 +1,4 @@
-#include "tc.h"
+#include "kernel.h"
 #include "kam.h"
 #include "fuse.h"
 #include "fix.h"
@@ -102,7 +102,6 @@ static void add_unchecked(Environment& env, const Decl& d) {
   }
 }
 
-static u64 g_fusion_retries = 0;
 static Shared* g_shared = nullptr;         // claim flags, shared with the workers
 static WorkerResult* g_results = nullptr;  // one slot per worker
 static int g_worker = -1;                  // this process's worker index, -1 = not a worker
@@ -203,13 +202,6 @@ static int run(const Options& opt) {
     }
     return 0;
   }
-  if (opt.max_depth) g_max_depth = opt.max_depth;
-  if (g_engine == 2 && !getenv("LL_FIX")) g_fix = 0;   // the differential mode compares whnf results syntactically; fixpoint rules change their shape
-  const int fuse_default = g_fuse, fix_default = g_fix;
-  // LL_FUSE_BUDGET: wrapper unfoldings before a declaration is rechecked with fusion; 0 turns
-  // the two-attempt scheme off (fusion from the start, as before)
-  const u64 fuse_budget = getenv("LL_FUSE_BUDGET") ? strtoull(getenv("LL_FUSE_BUDGET"), nullptr, 10) : 20000;
-  const bool two_attempts = fuse_budget != 0 && (fuse_default || fix_default);
   g_max_rss_kb = opt.max_rss_mb * 1024;
 
   Environment env;
@@ -276,7 +268,7 @@ static int run(const Options& opt) {
   }
 
   size_t ok = 0, failed = 0, unchecked = 0;
-  CheckStats st;
+  struct { u64 steps = 0; } st;
   std::vector<std::pair<double, std::string>> slow;
   size_t peak_exprs = 0;
   size_t di = 0;
@@ -311,35 +303,13 @@ static int run(const Options& opt) {
     try {
       if (check) {
         if (prebuilt) for (const ConstInfo& c : d.consts) env.hide(c.name);   // let check_and_add add them
-        size_t mark = env.mark();
-        if (g_nbe && nbe_check(env, d)) {
-          // accepted by the evaluation engine; anything it declines is checked below
-          env.add(std::move(d.consts[0]));
-        } else try {
-          if (two_attempts) { g_fuse = 0; g_fix = 0; g_step_budget = fuse_budget; } g_decl_work = 0; g_decl_wrap = 0;
-          u64 d0 = g_k_delta, i0 = g_k_iota, s0 = st.steps;
-          check_and_add(env, d, opt.trust_inductives, st);
-          static const long rep = getenv("LL_WORK_REPORT") ? atol(getenv("LL_WORK_REPORT")) : -1;
-          if (rep >= 0 && (long)(st.steps - s0) >= rep)
-            std::cerr << "WORK " << nm() << " steps " << (st.steps - s0) << " delta " << (g_k_delta - d0)
-                      << " wrapper " << g_decl_wrap << " iota " << (g_k_iota - i0) << "\n";
-        } catch (NeedsFusion&) {
-          // it computes: throw the attempt away and check it again with fusion and rules on
-          env.rollback(mark);
-          g_lctx.decls.clear();
-          fix_before_reclaim(); g_exprs->reclaim(); fix_after_reclaim();
-          g_fusion_retries++;
-          g_fuse = fuse_default; g_fix = fix_default; g_step_budget = 0; g_decl_work = 0; g_decl_wrap = 0;
-          check_and_add(env, d, opt.trust_inductives, st);
-        }
-        g_fuse = fuse_default; g_fix = fix_default; g_step_budget = 0;
+        check_decl(env, d);
         ok++;
       } else if (!prebuilt) {
         add_unchecked(env, d);
         unchecked++;
       }
     } catch (KernelError& e) {
-      g_fuse = fuse_default; g_fix = fix_default; g_step_budget = 0;
       failed++;
       std::cerr << "FAIL " << nm() << " (line " << d.line << "): " << e.what() << "\n";
       if (!opt.keep_going) {
@@ -364,7 +334,8 @@ static int run(const Options& opt) {
     // The environment has its own copy of what it needs: the export's is no longer used.
     std::vector<ConstInfo>().swap(d.consts);
     { static const bool mr = getenv("LL_MEMREPORT") != nullptr; static long last = 0;
-      if (mr && (ok & 255) == 0) {
+      static const unsigned every = mr && atoi(getenv("LL_MEMREPORT")) == 2 ? 0 : 255;   // LL_MEMREPORT=2: after every declaration
+      if (mr && (ok & every) == 0) {
         FILE* f = fopen("/proc/self/status", "r"); char line[256]; long hwm = 0;
         if (f) { while (fgets(line, sizeof line, f)) sscanf(line, "VmHWM: %ld", &hwm); fclose(f); }
         if (hwm > last + 51200) { std::cerr << "mem peak " << hwm / 1024 << " MB at declaration " << ok << " " << nm() << "\n"; last = hwm; }
@@ -377,8 +348,7 @@ static int run(const Options& opt) {
   double t2 = now();
   if (g_worker >= 0) worker_exit(ok, failed, unchecked, st.steps, peak_exprs, t2 - t1);
   std::cerr << "checked " << ok << " declarations, " << failed << " failed, " << unchecked << " added unchecked, in "
-            << (t2 - t1) << "s; " << st.steps << " reduction steps; " << g_exprs->size() << " exprs live"
-            << (g_engine == 2 ? "; engine mismatches: " + std::to_string(g_engine_mismatches) : std::string("")) << "\n";
+            << (t2 - t1) << "s; " << g_exprs->size() << " exprs live\n";
   mem_report("end");
   if (getenv("LL_MEMREPORT")) {
     size_t ci = 0; for (const ConstInfo& c : env.consts) ci += sizeof(ConstInfo) + (c.lparams.capacity() + c.all.capacity() + c.ctors.capacity()) * 4 + c.rules.capacity() * sizeof(RecRule);
@@ -386,19 +356,13 @@ static int run(const Options& opt) {
     std::cerr << "env consts " << env.consts.size() << " (" << (ci >> 20) << " MB), export decls " << ef.decls.size() << " (" << (di >> 20) << " MB), names " << g_names->nodes.size() << " x " << sizeof(NameNode) << " B\n";
   }
   nbe_report();
-  std::cerr << "counters: defeq " << g_cnt_defeq << " (quick " << g_cnt_defeq_quick << ", proof-irrel " << g_cnt_pi << ", lazy " << g_cnt_lazy << ", binding " << g_cnt_binding
-            << "); infer " << g_cnt_infer << " (hit " << g_cnt_infer_hit << "); whnf " << g_cnt_whnf << " (hit " << g_cnt_whnf_hit << "); whnf_core " << g_cnt_whnfcore << " (hit " << g_cnt_whnfcore_hit << ")\n";
-  if (getenv("LL_COUNT_REPEATS")) std::cerr << "defeq pairs compared again: " << g_cnt_defeq_repeat << " (of which previously failed: " << g_cnt_defeq_refail << ")\n";
-  std::cerr << "subst engine: unfold " << g_cnt_unfold << ", iota/proj/quot " << g_cnt_iota << "; spine-prefix cache hits " << g_cnt_prefix_hits << "\n";
   std::cerr << "machine: app " << g_k_app << ", bvar " << g_k_bvar << ", beta " << g_k_beta << ", let " << g_k_let << ", delta " << g_k_delta << ", iota " << g_k_iota << ", proj " << g_k_proj << ", enter value/delayed/re-eval " << g_k_enter_val << "/" << g_k_enter_delayed << "/" << g_k_reeval << ", memo hit/insert " << g_k_memo_hit << "/" << g_k_memo_ins << "\n";
-  std::cerr << "declarations rechecked with fusion: " << g_fusion_retries << "\n";
   { std::cerr << "intern: permanent probes " << g_int_perm_probe << " (hits " << g_int_perm_hit << "), temporary hits " << g_int_temp_hit << ", new " << g_int_new << "; by kind";
     const char* kn[] = {"bvar","fvar","sort","const","app","lam","pi","let","lit","proj","clos"};
     for (int i = 0; i < 11; i++) std::cerr << " " << kn[i] << " " << g_int_kind[i];
     std::cerr << "\n"; }
   if (g_fix) std::cerr << "fixpoint rules: derived " << g_fix_derived << ", rejected " << g_fix_rejected << ", applied " << g_fix_applied << "\n";
   if (g_fuse) std::cerr << "fusion: bodies " << g_fuse_bodies << ", unfolds " << g_fuse_unfolds << ", betas " << g_fuse_betas << ", iotas " << g_fuse_iotas << ", projs " << g_fuse_projs << ", overflows " << g_fuse_overflows << "\n";
-  std::cerr << "closures: " << g_cnt_clos << " created, " << g_cnt_expose << " exposed, " << g_cnt_env << " envs, " << g_cnt_clos_compose << " composed, " << g_cnt_clos_expand << " expanded\n";
   if (getenv("LL_HIST")) {
     auto dump = [](const char* title, std::unordered_map<u32, u64>& h) {
       std::vector<std::pair<u64, u32>> v; for (auto& kv : h) v.push_back({kv.second, kv.first});
@@ -432,14 +396,12 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     if (a == "-v" || a == "--verbose") opt.verbose = true;
-    else if (a == "--trust-inductives") opt.trust_inductives = true;
     else if (a == "-k" || a == "--keep-going") opt.keep_going = true;
     else if (a == "--only" && i + 1 < argc) opt.only = argv[++i];
     else if (a == "--stop-at" && i + 1 < argc) opt.stop_at = argv[++i];
     else if (a == "--from-line" && i + 1 < argc) opt.from_line = atol(argv[++i]);
     else if (a == "--count" && i + 1 < argc) opt.count = atol(argv[++i]);
     else if (a == "--slow" && i + 1 < argc) opt.slow = atof(argv[++i]);
-    else if (a == "--max-depth" && i + 1 < argc) opt.max_depth = atoi(argv[++i]);
     else if (a == "--max-rss" && i + 1 < argc) opt.max_rss_mb = atol(argv[++i]);   // MB
     else if (a == "--progress" && i + 1 < argc) opt.progress = argv[++i];
     else if (a == "--trust-file" && i + 1 < argc) opt.trust_file = argv[++i];
@@ -449,7 +411,6 @@ int main(int argc, char** argv) {
     else if (a == "--no-memo") g_memo = 0;
     else if ((a == "-j" || a == "--jobs") && i + 1 < argc) opt.jobs = (unsigned)atoi(argv[++i]);
     else if (a == "--shard" && i + 1 < argc) { std::string s = argv[++i]; size_t p = s.find('/'); opt.shard = atoi(s.substr(0, p).c_str()); opt.nshards = atoi(s.substr(p + 1).c_str()); }
-    else if (a == "--engine" && i + 1 < argc) { std::string e = argv[++i]; g_engine = e == "subst" ? 0 : e == "kam" ? 1 : e == "both" ? 2 : atoi(e.c_str()); }
     else if (a[0] == '-') { std::cerr << "unknown option " << a << "\n"; return 2; }
     else opt.file = a;
   }
