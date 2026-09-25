@@ -1,19 +1,24 @@
 # lazylean
 
-A type checker for Lean 4 that reduces terms the way the Coq kernel does.
+A type checker for Lean 4 with two engines: a normalisation-by-evaluation checker that
+handles almost every declaration, and a Coq-style lazy abstract machine behind it.
 
 It reads the standard `lean4export` format and re-checks every declaration: definitions,
 theorems, axioms, quotients, and inductive types with their recursors re-derived from scratch.
-The type-checking algorithm is the one in Lean's own kernel. The reduction engine is not. Where
-Lean's kernel rewrites terms by substitution, lazylean runs a Krivine machine with call-by-need
-thunks, after Coq's `cClosure`.
+Definitions, theorems and axioms are checked first by an evaluator that turns terms into
+semantic values (closures over environments, neutral terms with a spine of eliminations) and
+decides definitional equality on those, as smalltt and sokonanoda do. Anything it declines --
+a budget exceeded, a construct it does not handle, or a check that fails -- is checked again by
+the reference type checker, which follows Lean's own kernel algorithm and reduces with a
+Krivine machine with call-by-need thunks, after Coq's `cClosure`. That checker's verdict is
+final, so the evaluator only ever has to be right when it accepts.
 
-The difference shows up on proofs that compute. On the Lean Kernel Arena's performance suite
-lazylean is four times faster than any other checker, and it checks all of Mathlib, 654 504
-declarations, in 102 seconds on eight cores. On the Four Colour Theorem's 201 672-declaration
-dependency closure it needs 3.9 core-hours where Lean's kernel needs 7.5, and where Lean's
-kernel dies at 178 GB on a raw port of Gonthier's reducibility check, lazylean finishes it in
-21 GB.
+On the Lean Kernel Arena's ranking measure, the instructions executed to check all of Mathlib,
+lazylean 0.4.0 needs 0.49 × 10¹² instructions for 654 504 declarations, on one core, in under
+four minutes: a third less than the fastest checker of the 2026-09 round and eleven times less
+than lazylean 0.3.0. On the Four Colour Theorem's 201 672-declaration dependency closure the
+lazy machine needs 3.9 core-hours where Lean's kernel needs 7.5, and where Lean's kernel dies at
+178 GB on a raw port of Gonthier's reducibility check, it finishes in 21 GB.
 
 ```
 lean4export Foo -- Foo.theorem > foo.ndjson
@@ -23,6 +28,7 @@ lazylean foo.ndjson        # exit 0: every declaration accepted
 ## Contents
 
 - [Why a lazy kernel](#why-a-lazy-kernel)
+- [The evaluation engine](#the-evaluation-engine)
 - [How it works](#how-it-works)
 - [Performance](#performance)
 - [How it was tested](#how-it-was-tested)
@@ -54,6 +60,54 @@ time and especially in memory. The Four Colour Theorem is the canonical example:
 Coq proof checks 633 configurations by running a Kempe-chain closure inside the kernel. A Lean
 port of that check makes Lean's kernel unusable past ring size 12, at 166 GB. lazylean was
 written to close that gap while keeping Lean's logic and Lean's verdicts.
+
+## The evaluation engine
+
+The arena ranks checkers by the number of instructions they execute on Mathlib. Mathlib is
+650 000 small declarations and almost no computation, so what that measures is the constant
+cost of checking an ordinary declaration: building terms, instantiating binders, looking things
+up. The substitution-based checker below spends most of its time on exactly that -- every
+`instantiate` interns new terms, and every declaration starts with empty caches -- and on
+Mathlib it executes 5.5 × 10¹² instructions. `src/nbe.cpp` is a second checker built for the
+other end of the trade-off.
+
+**Values, not terms.** A term is evaluated against an environment into a value: a closure for
+a λ or a Π, a *neutral* for anything headed by a variable or a constant, with the arguments and
+projections applied to it kept as a spine, and sorts and literals. β is an extension of the
+environment. A variable entering scope is a fresh de Bruijn *level*, identified by its level and
+its type. Constants stay folded: a definition is unfolded only when conversion or a recursor
+needs it, and the unfolding is stored in the value. Nothing is substituted and no term is built;
+type inference runs on values too, and the type of a λ is a Π whose body is *inferred* when it is
+instantiated.
+
+**Hash-consing and pruned environments.** Neutral applications are hash-consed by
+(function, argument), environments by (parent, value), fresh variables by (level, type), so the
+same value built twice is the same pointer and most conversion checks end on a pointer
+comparison. The caches for evaluation and inference are keyed by (environment, term), where the
+environment is first *pruned* to the variables the term actually mentions (a 64-bit mask per term,
+computed once), so a subterm's value is shared by every context that agrees on its free
+variables. Measured on Std, pruning turned 41% of evaluation misses into hits.
+
+**Sessions.** Values live in a bump arena, and the arena and every cache last for a *session*
+of about a gigabyte of values -- tens of thousands of declarations -- rather than for one
+declaration. The environment only grows and a value means the same thing wherever it is used, so
+a constant's type, an instance's unfolding or a conversion already decided is paid for once per
+session. The caches are open-addressing tables whose memory is mapped once, 2 MB-aligned and
+pre-faulted, and reused across sessions, so the kernel's page-fault work is paid once too.
+
+**Conversion** follows Lean's `is_def_eq` in substance: lazy δ by reducibility hints, same-head
+arguments compared before unfolding (with a step budget, after sokonanoda), ι, projections, K,
+structure η, η, proof irrelevance, unit-like types, `Nat` literals with GMP, `String` literals,
+and positive and negative caches. *Relevance signatures*, computed once per constant and
+universe instantiation from its type alone, say which argument positions hold proofs (they need
+not be compared once the arguments before them agree) and whether an application is a proof at
+all (then proof irrelevance needs no type inference).
+
+**Only when it pays, and never as the last word.** A declaration that takes more than a million
+evaluation steps is declined and checked by the lazy machine, which is the better engine for
+computation. Inductive types and quotients always go to the reference checker. Any failure in
+the evaluator -- including a genuine type error -- is a decline, and the reference checker then
+gives the verdict.
 
 ## How it works
 
@@ -275,7 +329,37 @@ end.
 
 ## Performance
 
-### Version 0.3.0
+### Version 0.4.0: instructions, the arena's measure
+
+The Lean Kernel Arena ranks checkers first by their verdicts and then by the number of
+instructions (`perf stat -e instructions`, summed over every thread and process) they execute
+on the Mathlib export; its time columns are that count divided by 6 × 10⁹. Wall clock does not
+enter the ranking, and neither does the number of cores, which is why 0.4.0 runs as a single
+process. Billions of instructions, all declarations accepted in every run:
+
+| corpus | declarations | lazylean 0.3.0 | mathgraph | sokonanoda | nanoclo | Lean's kernel | lazylean 0.4.0 |
+|---|---|---|---|---|---|---|---|
+| Init | 53 093 | 213 | 37 | 39 | 121 | 367 | **22** |
+| Std | 90 778 | 351 | 62 | 65 | 201 | 617 | **37** |
+| con-leche | 26 819 | 457 | 157 | 162 | 315 | 665 | **76** |
+| CSLib | 370 939 | 1 248 | 237 | 249 | 775 | 2 428 | **148** |
+| Mathlib | 654 504 | 5 529 | 709 | 745 | 3 064 | 11 832 | **485** |
+
+The other columns are the arena's own figures from round 2026-09; lazylean 0.4.0 was measured
+the same way (`perf stat -e instructions`, single process, `-k`) on a 64-core AMD EPYC 7B13 VM.
+On Mathlib that is 81 s of the arena's virtual time against 118 s for the round's fastest
+checker; the real run takes 197 s of wall clock on one core and peaks at 10.9 GB.
+
+Where the eleven-fold reduction on Mathlib came from, in the order it was made: the evaluation
+engine itself (5.5 → 0.92 × 10¹²), reusing its memory across sessions instead of returning it
+to the kernel (→ 0.71), pruned environments as cache keys (→ 0.69), a loader that parses each
+line in one pass and appends nodes without a lookup, and memoised universe-level normalisation,
+which had been a fifth of the time on late Mathlib because it compared parameter names through
+heap-allocated vectors (→ 0.58), and walking a function's type as a telescope without building
+the intermediate Π values (→ 0.49).
+
+
+### Version 0.3.0 (wall clock)
 
 Version 0.3.0 is three times faster than 0.2.0 on Mathlib at the same eight workers, and two
 and a half to three and a half times faster on every other library. Both versions below ran on
@@ -435,6 +519,17 @@ without a remaining disagreement, after fixing the ones it found: a segfault on 
 variables, over-strict checks on derived inductive metadata, an accepted block with
 inconsistent `isUnsafe` flags, and quotient types.
 
+**The evaluation engine** is held to the same tests, and more strictly, since an acceptance
+by it is final. Every run of the arena suite and of the corpora above goes through it first. A
+bad test it accepted would show up as a wrong verdict, because nothing re-checks what it
+accepts; the arena's `bugs/proj-of-subst-prop` did exactly that in its first version (it
+answered "not a proposition" for a type whose sort is stuck, where lean4#14807 makes that an
+error), which is fixed. The mutation fuzzer ran 14 400 mutations of `Init.Prelude` against it
+with no case of lazylean accepting what Lean's kernel rejects. The five disagreements the other
+way were all mutated inductive metadata (`numIndices`), which the reference checker recomputed
+but then added from the export; it now adds the values it derives, as Lean's kernel does, and
+checks that each constructor names its own inductive type.
+
 **Verified shortcuts.** Anything the machine does that is not a plain β/δ/ι step is either
 sound by construction or checked by the kernel. Fusion is built only from β/δ/ι/projection
 reductions. Every fixpoint rule is verified with `is_def_eq` on fresh variables before it is
@@ -452,6 +547,8 @@ GMP is the only dependency (`libgmp-dev`). Exit status 0 means every declaration
 1 that one was rejected, 2 that one was declined (see Limitations).
 
 ```
+LL_NBE=0 lazylean export.ndjson              the reference checker alone (no evaluation engine)
+lazylean --from-line L --count N export.ndjson   check N declarations starting at line L
 lazylean -k -v --slow 1 export.ndjson        keep going after a failure, log each declaration,
                                              list the ones slower than 1 s
 lazylean -j 8 export.ndjson                  check with 8 worker processes: the export is
