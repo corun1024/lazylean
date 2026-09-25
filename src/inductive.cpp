@@ -601,6 +601,7 @@ void add_inductive_decl(Environment& env, const Decl& d, bool /*trust*/) {
           const ConstInfo* ex = nullptr;
           for (size_t q = d.ntypes; q < d.ntypes + d.nctors; q++) if (d.consts[q].name == ct.name) ex = &d.consts[q];
           if (ex->nfields != c.nfields || ex->nparams != nparams || ex->cidx != c.cidx) fail("constructor field/parameter/index counts do not match: " + name_str(ct.name));
+          if (ex->induct != c.induct) fail("constructor '" + name_str(ct.name) + "' names the wrong inductive type");
         }
         env.add(c);
       }
@@ -655,7 +656,16 @@ void add_inductive_decl(Environment& env, const Decl& d, bool /*trust*/) {
     // For comparison we need an environment where the *original* constants are the real ones:
     // roll back to the mark and add the exported types and constructors.
     env.rollback(mark);
-    for (size_t k = 0; k < d.ntypes + d.nctors; k++) env.add(d.consts[k]);
+    // The types go in with the metadata derived here, not the exported one: the export's
+    // numIndices, isRec, isReflexive and numNested were only cross-checked above, and the
+    // conversion checker relies on them (structure-likeness, projections, K), as Lean's kernel
+    // relies on the values it computes itself.
+    for (size_t k = 0; k < d.ntypes; k++) {
+      ConstInfo c = d.consts[k];
+      c.nindices = ai.nindices[k]; c.is_rec = is_rec; c.is_reflexive = is_reflexive; c.nnested = (u32)nnested;
+      env.add(c);
+    }
+    for (size_t k = d.ntypes; k < d.ntypes + d.nctors; k++) env.add(d.consts[k]);
     for (const ConstInfo& dc : derived) {
       const ConstInfo* ec = nullptr;
       for (size_t k = d.ntypes + d.nctors; k < d.consts.size(); k++) if (d.consts[k].name == dc.name) ec = &d.consts[k];
