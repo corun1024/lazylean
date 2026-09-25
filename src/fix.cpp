@@ -9,7 +9,6 @@
 
 namespace ll {
 
-int g_fix = getenv("LL_FIX") ? atoi(getenv("LL_FIX")) : 1;
 u64 g_fix_derived = 0, g_fix_rejected = 0, g_fix_applied = 0;
 static const char* g_fix_trace = getenv("LL_FIX_TRACE");
 
@@ -283,17 +282,7 @@ bool derive(const Environment& env, const ConstInfo& c, FixRule& out) {
 
 } // namespace
 
-static bool skipped(Name n) {
-  static const char* sk = getenv("LL_FIX_SKIP");
-  if (!sk) return false;
-  std::string s = std::string(",") + sk + ",", nm = "," + name_str(n) + ",";
-  return s.find(nm) != std::string::npos;
-}
 const FixRule* fix_rule(const Environment& env, const ConstInfo& c) {
-  if (!g_fix) return nullptr;
-  if (c.fix_idx < 0 && skipped(c.name)) { slot_for(c).state = 4; return nullptr; }
-  // not yet worth a derivation and its verification: unfold the definition as usual
-  if (unfold_count(c.name) < g_fix_min && slot_for(c).state == 0) return nullptr;
   Slot& s = slot_for(c);
   if (s.state == 2 || s.state == 3) return &s.rule;
   if (s.state != 0) return nullptr;

@@ -361,8 +361,8 @@ static int run(const Options& opt) {
     const char* kn[] = {"bvar","fvar","sort","const","app","lam","pi","let","lit","proj","clos"};
     for (int i = 0; i < 11; i++) std::cerr << " " << kn[i] << " " << g_int_kind[i];
     std::cerr << "\n"; }
-  if (g_fix) std::cerr << "fixpoint rules: derived " << g_fix_derived << ", rejected " << g_fix_rejected << ", applied " << g_fix_applied << "\n";
-  if (g_fuse) std::cerr << "fusion: bodies " << g_fuse_bodies << ", unfolds " << g_fuse_unfolds << ", betas " << g_fuse_betas << ", iotas " << g_fuse_iotas << ", projs " << g_fuse_projs << ", overflows " << g_fuse_overflows << "\n";
+  std::cerr << "fixpoint rules: derived " << g_fix_derived << ", rejected " << g_fix_rejected << ", applied " << g_fix_applied << "\n";
+  std::cerr << "fusion: bodies " << g_fuse_bodies << ", unfolds " << g_fuse_unfolds << ", betas " << g_fuse_betas << ", iotas " << g_fuse_iotas << ", projs " << g_fuse_projs << ", overflows " << g_fuse_overflows << "\n";
   if (getenv("LL_HIST")) {
     auto dump = [](const char* title, std::unordered_map<u32, u64>& h) {
       std::vector<std::pair<u64, u32>> v; for (auto& kv : h) v.push_back({kv.second, kv.first});
@@ -406,9 +406,7 @@ int main(int argc, char** argv) {
     else if (a == "--progress" && i + 1 < argc) opt.progress = argv[++i];
     else if (a == "--trust-file" && i + 1 < argc) opt.trust_file = argv[++i];
     else if (a == "--print" && i + 1 < argc) opt.print.push_back(argv[++i]);
-    else if (a == "--memo") g_memo = 1;
     else if (a == "--strict-metadata") g_strict_metadata = true;
-    else if (a == "--no-memo") g_memo = 0;
     else if ((a == "-j" || a == "--jobs") && i + 1 < argc) opt.jobs = (unsigned)atoi(argv[++i]);
     else if (a == "--shard" && i + 1 < argc) { std::string s = argv[++i]; size_t p = s.find('/'); opt.shard = atoi(s.substr(0, p).c_str()); opt.nshards = atoi(s.substr(p + 1).c_str()); }
     else if (a[0] == '-') { std::cerr << "unknown option " << a << "\n"; return 2; }

@@ -22,14 +22,11 @@ static long g_call_no = 0;
 u64 g_k_memo_hit = 0, g_k_memo_ins = 0;
 std::unordered_map<u32, u64> g_delta_hist, g_iota_hist;   // LL_HIST: unfoldings per constant, iota per recursor
 static bool g_hist = getenv("LL_HIST") != nullptr;
-int g_memo = getenv("LL_MEMO") ? atoi(getenv("LL_MEMO")) : 1;   // default on; LL_MEMO=0 / --no-memo to disable
 u64 g_k_app = 0, g_k_bvar = 0, g_k_beta = 0, g_k_let = 0, g_k_delta = 0, g_k_iota = 0, g_k_proj = 0, g_k_projk = 0, g_k_reck = 0, g_k_natk = 0, g_k_enter_val = 0, g_k_enter_delayed = 0, g_k_reeval = 0;
 u64 g_nat_ops = 0, g_nat_cycles = 0, g_nat_limbs = 0, g_natlit_cycles = 0;
 static inline u64 rdtsc_() { unsigned lo, hi; __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi)); return ((u64)hi << 32) | lo; }
 
-int g_engine = 1;
 extern bool g_trace_steps;
-static int g_orig_policy = getenv("LL_ORIG") ? (std::string(getenv("LL_ORIG")) == "all" ? 2 : std::string(getenv("LL_ORIG")) == "none" ? 0 : 1) : 2;  // 0 none, 1 probed, 2 all (default: kernel-structural readback)
 u64 g_kam_steps = 0;
 
 // ---------------------------------------------------------------- allocation
@@ -115,11 +112,10 @@ Ref<Thunk> Machine::mk_thunk(Expr term, const Ref<Env>& env) {
   // A bound variable is resolved to its environment entry right away (Coq's `mk_clos` on `Rel`):
   // a wrapper closure would capture the whole environment for as long as it stays unforced.
   if (is_bvar(term)) return Ref<Thunk>(lookup(env.get(), bvar_idx(term)));
-  static int closed_policy = getenv("LL_CLOSED") ? atoi(getenv("LL_CLOSED")) : 1;   // 0: no sharing of closed subterms, 1: all, 2: constants only
-  if (!has_loose_bvars(term) && closed_policy) {
+  if (!has_loose_bvars(term)) {
     // closed subterm: one shared thunk per declaration (values persist across machine runs)
     EKind k = kind(term);
-    if ((closed_policy == 1 && (k == EKind::App || k == EKind::Proj || k == EKind::Let)) || (k == EKind::Const)) {
+    if (k == EKind::App || k == EKind::Proj || k == EKind::Let || k == EKind::Const) {
       ClosedThunkMap& m = closed_map();
       auto it = m.find(term);
       if (it != m.end()) return it->second;
@@ -232,11 +228,9 @@ struct MachineRun {
   void push_args(const std::vector<Ref<Thunk>>& args) { for (size_t i = args.size(); i-- > 0;) push_arg(args[i]); }
 
   // Enter thunk `t`: use its value if it has one for the current mode, otherwise evaluate it under
-  // an update mark.  The thunk's original closure is released while it is being evaluated.
-  // `probe` = the thunk is evaluated to look at its value (a major premise, a projection's
-  // structure, a primitive's operand) but may stay in the result as it was written; its original
-  // closure is then kept so that reading it back gives the term the kernel would produce.
-  void enter(Thunk* t, bool probe = false) {
+  // an update mark.  The thunk keeps its original closure, so that reading it back gives the term
+  // as it was written (a thunk entered to look at its value may stay in the result unreduced).
+  void enter(Thunk* t) {
     Ref<Thunk> keep(t);
     // A value computed with delta must not be used as the head of a no-delta (whnf_core) run:
     // it may be reduced further than whnf_core would go (shared thunks persist across runs).
@@ -245,10 +239,10 @@ struct MachineRun {
     if (t->state == 3 || (t->state == 2 && !delta)) { g_k_enter_val++; if (g_trace_steps) std::cerr << "  [enter value state " << (int)t->state << "]\n"; h = t->vterm; env = t->venv; push_args(t->args); return; }
     if (t->state == 1) fail("lazy machine: cyclic thunk");
     g_k_enter_delayed++;
-    // Memoisation (LL_MEMO=1): a delayed application under an environment is keyed by its
-    // read-back (the term the kernel would see); equal closures share one value, as with the
-    // kernel's whnf cache.  Only in delta runs, whose values do not depend on the run's flags.
-    if (g_memo && delta && t->state == 0 && t->term != NIL && is_app(t->term) && has_loose_bvars(t->term)) {
+    // Memoisation: a delayed application under an environment is keyed by its read-back (the term
+    // the kernel would see); equal closures share one value, as with a kernel's whnf cache.  Only
+    // in delta runs, whose values do not depend on the run's flags.
+    if (delta && t->state == 0 && t->term != NIL && is_app(t->term) && has_loose_bvars(t->term)) {
       ClosedThunkMap& m = M.closed_map();
       Expr key = M.readback(t);
       auto it = m.find(key);
@@ -264,8 +258,7 @@ struct MachineRun {
     }
     Frame f; f.k = Frame::Upd; f.th = keep; st.push_back(std::move(f));
     if (t->state == 2) { h = t->vterm; env = std::move(t->venv); std::vector<Ref<Thunk>> a; a.swap(t->args); push_args(a); }
-    else if ((probe && g_orig_policy >= 1) || g_orig_policy == 2) { h = t->term; env = t->env; }
-    else { h = t->term; env = std::move(t->env); t->term = NIL; }
+    else { h = t->term; env = t->env; }
     if (g_hist) { g_state_live[t->state]--; g_state_live[1]++; }
     t->state = 1; t->rb = NIL;
   }
@@ -307,7 +300,7 @@ struct MachineRun {
     st.push_back(std::move(k));
     if (st.size() > g_max_frames) g_max_frames = st.size();
     delta = true;
-    enter(t, true);
+    enter(t);
   }
 
   static bool is_ctor_head(const Environment& env, Expr head, const ConstInfo** out) {
@@ -597,7 +590,7 @@ struct MachineRun {
           if (nat_compute(n, args)) return false;
           push_args(args);
         }
-        if (delta && c->kind == CKind::Def && g_fix && g_levels->list_size(const_levels(h)) == c->lparams.size()) {
+        if (delta && c->kind == CKind::Def && g_levels->list_size(const_levels(h)) == c->lparams.size()) {
           // Fixpoint rule (fix.h): reduce straight to the arm when the recursive argument is a
           // constructor; otherwise unfold as usual.
           const FixRule* r = fix_rule(tc.env, *c);
@@ -638,7 +631,7 @@ struct MachineRun {
         Frame k; k.k = Frame::ProjK; k.c.reset(new Cont{h, env, {}}); k.th = s; k.saved_delta = delta;
         st.push_back(std::move(k));
         if (!cheap_proj) delta = true;   // the structure is fully normalised (kernel: whnf)
-        enter(s.get(), true);
+        enter(s.get());
         return false;
       }
     }
@@ -708,7 +701,7 @@ struct MachineRun {
 void Machine::force(Thunk* th, bool delta) {
   if (th->state == 3 || (th->state == 2 && !delta)) return;
   MachineRun R(*this, delta, false);
-  R.enter(th, true);
+  R.enter(th);
   std::vector<Ref<Thunk>> rest;
   R.loop(rest);
   // `enter` pushed an update mark for th, which the unwinder assigned; the head's arguments

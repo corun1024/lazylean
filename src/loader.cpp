@@ -291,10 +291,8 @@ static ExportFile load_once(const std::string& path, bool verbose, bool bulk);
 // nodes and indexing them in parallel afterwards.  Should two turn out equal, the file is loaded
 // again with ordinary interning, which is what gives equal terms a single handle.
 ExportFile load_export(const std::string& path, bool verbose) {
-  static const bool no_bulk = getenv("LL_LOAD_SEQUENTIAL") != nullptr;
-  if (!no_bulk) {
+  {
     ExportFile ef = load_once(path, verbose, true);
-    if (getenv("LL_DEBUG_NO_INDEX")) return ef;   // measurement only: the permanent tier is left unindexed
     if (g_exprs->build_index(8)) return ef;
     std::cerr << "note: the export repeats an expression; loading it again with ordinary interning\n";
     g_exprs->reset_permanent();
@@ -326,7 +324,6 @@ static ExportFile load_once(const std::string& path, bool verbose, bool bulk) {
   L.exprs.reserve(lines);
   advise_huge(L.exprs.data(), lines * sizeof(Expr));
   L.names.reserve(lines / 8);
-  static const bool no_fast = getenv("LL_LOAD_SLOW") != nullptr;   // testing: force the JSON reader
   // The mapped file would otherwise stay resident for the whole load (gigabytes for Mathlib), on
   // top of what the load builds; pages already read are handed back as the cursor moves on.
   const size_t page = (size_t)sysconf(_SC_PAGESIZE), window = (size_t)64 << 20;
@@ -338,7 +335,7 @@ static ExportFile load_once(const std::string& path, bool verbose, bool bulk) {
       released = upto;
     }
     L.line++;
-    if (!no_fast) {   // the common line shapes are parsed up to and including their terminator
+    {   // the common line shapes are parsed up to and including their terminator
       const char* next = nullptr;
       try { next = L.fast(q, end); }
       catch (KernelError& e) { munmap((void*)base, sz); fail("line " + std::to_string(L.line) + ": " + e.what()); }
@@ -364,15 +361,6 @@ static ExportFile load_once(const std::string& path, bool verbose, bool bulk) {
     if (verbose && L.line % 1000000 == 0) std::cerr << "  ... " << L.line << " lines\n";
   }
   munmap((void*)base, sz);
-  if (getenv("LL_LOAD_CHECKSUM")) {
-    // testing: a digest of everything the load produced, in index order, to compare loaders
-    u64 h = 0x9E3779B97F4A7C15ull;
-    for (Expr e : L.exprs) h = mix(h, e == NIL ? 0 : raw(e).hash);
-    for (Name n : L.names) h = mix(h, n == NIL ? 0 : (*g_names)[n].hash);
-    for (Level l : L.levels) h = mix(h, l);
-    std::cerr << "load checksum " << std::hex << h << std::dec << " exprs " << L.exprs.size()
-              << " names " << L.names.size() << " levels " << L.levels.size() << "\n";
-  }
   return std::move(L.out);
 }
 

@@ -88,11 +88,11 @@ void check_dup_lparams(const std::vector<Name>& ps) {
 
 MachineCtx::~MachineCtx() { if (closed_thunks) free_closed_thunks(closed_thunks); }
 
-// The value of the definition head `f` (levels instantiated), fused when fusion is on (fuse.h).
+// The value of the definition head `f` (levels instantiated), fused if it is a definition (fuse.h).
 Expr MachineCtx::unfold_value(Expr f, const ConstInfo& c) {
   auto it = unfold_cache.find(f);
   if (it != unfold_cache.end()) return it->second;
-  bool fuse = g_fuse && c.kind == CKind::Def && bump_unfolds(c.name) >= g_fuse_min;
+  bool fuse = c.kind == CKind::Def;
   if (c.lparams.empty() && !fuse) return c.value;
   Expr v = c.lparams.empty() ? c.value : instantiate_lparams(c.value, c.lparams, g_levels->list(const_levels(f)));
   if (fuse) v = fuse_term(env, fuse_cache, v);

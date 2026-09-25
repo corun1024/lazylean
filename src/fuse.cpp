@@ -8,31 +8,6 @@
 
 namespace ll {
 
-int g_fuse = getenv("LL_FUSE") ? atoi(getenv("LL_FUSE")) : 1;
-unsigned g_fuse_min = getenv("LL_FUSE_MIN") ? (unsigned)atoi(getenv("LL_FUSE_MIN")) : 1;
-unsigned g_fix_min = getenv("LL_FIX_MIN") ? (unsigned)atoi(getenv("LL_FIX_MIN")) : 0;
-static std::vector<unsigned> g_unfolds;
-unsigned bump_unfolds(Name n) {
-  if (n >= g_unfolds.size()) g_unfolds.resize(std::max<size_t>(n + 1, g_unfolds.size() * 2 + 1024), 0);
-  return ++g_unfolds[n];
-}
-unsigned unfold_count(Name n) { return n < g_unfolds.size() ? g_unfolds[n] : 0; }
-u64 g_decl_wrap = 0;
-static std::vector<u8> g_wrapper_of;   // Name -> 0 unknown, 1 wrapper, 2 not
-bool is_recursion_wrapper(const ConstInfo& c) {
-  if (c.name < g_wrapper_of.size() && g_wrapper_of[c.name]) return g_wrapper_of[c.name] == 1;
-  const NameNode& nn = (*g_names)[c.name];
-  std::string_view last = nn.is_str ? std::string_view(nn.str) : std::string_view();
-  bool w = last == "casesOn" || last == "recOn" || last == "brecOn" || last == "binductionOn" || last == "_f" ||
-           last.substr(0, 6) == "match_" || last.substr(0, 14) == "_sparseCasesOn";
-  if (!w && last == "go" && nn.parent) { const NameNode& q = (*g_names)[nn.parent]; w = q.is_str && q.str == "brecOn"; }
-  if (c.name >= g_wrapper_of.size()) g_wrapper_of.resize(std::max<size_t>(c.name + 1, g_wrapper_of.size() * 2 + 1024), 0);
-  g_wrapper_of[c.name] = w ? 1 : 2;
-  return w;
-}
-static int g_fuse_iota = getenv("LL_FUSE_IOTA") ? atoi(getenv("LL_FUSE_IOTA")) : 1;
-static int g_fuse_reg = getenv("LL_FUSE_REG") ? atoi(getenv("LL_FUSE_REG")) : 0;   // inlining regular definitions at call sites is not canonical: off by default
-static int g_fuse_lamcheap = getenv("LL_FUSE_LAMCHEAP") ? atoi(getenv("LL_FUSE_LAMCHEAP")) : 1;
 u64 g_fuse_bodies = 0, g_fuse_unfolds = 0, g_fuse_betas = 0, g_fuse_iotas = 0, g_fuse_projs = 0, g_fuse_overflows = 0;
 
 // The Nat primitives the machine computes with GMP (kam.cpp is_nat_op): their heads must stay
@@ -100,7 +75,7 @@ bool unfoldable(const ConstInfo& c) {
     bool wrapper = last == "casesOn" || last == "recOn" || last == "brecOn" || last == "binductionOn" || last == "_f" ||
                    last.substr(0, 6) == "match_" || last.substr(0, 14) == "_sparseCasesOn";
     if (!wrapper && last == "go" && nn.parent) { const NameNode& p = (*g_names)[nn.parent]; wrapper = p.is_str && p.str == "brecOn"; }
-    size_t cap = wrapper ? 512 : c.hint == HintKind::Abbrev ? 256 : g_fuse_reg ? 128 : 0;
+    size_t cap = wrapper ? 512 : c.hint == HintKind::Abbrev ? 256 : 0;   // (a regular definition is not inlined: that would not be canonical)
     yes = body_size(c.value, cap) <= cap;
     // A regular definition that recurses (structurally, through brecOn/rec, or by well-founded
     // recursion) is left as a call: the machine gives it a fixpoint rule (fix.h), which an
@@ -118,7 +93,7 @@ bool unfoldable(const ConstInfo& c) {
 bool is_cheap_arg(const Environment& env, Expr a, unsigned depth = 0) {
   switch (kind(a)) {
     case EKind::BVar: case EKind::FVar: case EKind::Const: case EKind::Sort: case EKind::Lit: return true;
-    case EKind::Lam: return g_fuse_lamcheap;
+    case EKind::Lam: return true;
     case EKind::App: {
       if (depth > 3) return false;
       std::vector<Expr> args; Expr h = get_app_args_fn(a, args);
@@ -287,7 +262,7 @@ struct Fuser {
         const ConstInfo* c = env.find(const_name(f));
         if (!c) break;
         if (c->kind == CKind::Rec) {
-          Expr t = g_fuse_iota ? try_iota(*c, f, args) : NIL;
+          Expr t = try_iota(*c, f, args);
           if (t == NIL) break;
           if (depth >= 48) { dirty++; break; }
           g_fuse_iotas++;

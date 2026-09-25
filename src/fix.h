@@ -28,7 +28,6 @@ const FixRule* fix_rule(const Environment& env, const ConstInfo& c);
 void fix_before_reclaim();
 void fix_after_reclaim();
 
-extern int g_fix;   // LL_FIX=0 disables
 extern u64 g_fix_derived, g_fix_rejected, g_fix_applied;
 
 } // namespace ll

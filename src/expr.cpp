@@ -558,15 +558,14 @@ static bool all_closed(size_t n, const Expr* subst) {
 }
 // With closed entries the substitution is suspended in a Clos node: O(1) now, and later
 // paid only for the parts of the term that are actually looked at.
-static const bool g_lazy_subst = !getenv("LL_LAZY") || atoi(getenv("LL_LAZY")) != 0;   // LL_LAZY=0: always substitute eagerly
 Expr instantiate(Expr e, size_t n, const Expr* subst) {
   if (n == 0 || !has_loose_bvars(e)) return e;
-  if (!g_lazy_subst || !g_exprs->frozen || !all_closed(n, subst)) return instantiate_eager(e, n, subst);
+  if (!g_exprs->frozen || !all_closed(n, subst)) return instantiate_eager(e, n, subst);
   return mk_clos(e, g_exprs->mk_env(subst, n, false), 0);
 }
 Expr instantiate_rev(Expr e, size_t n, const Expr* subst) {
   if (n == 0 || !has_loose_bvars(e)) return e;
-  if (!g_lazy_subst || !g_exprs->frozen || !all_closed(n, subst)) return instantiate_rev_eager(e, n, subst);
+  if (!g_exprs->frozen || !all_closed(n, subst)) return instantiate_rev_eager(e, n, subst);
   return mk_clos(e, g_exprs->mk_env(subst, n, true), 0);
 }
 

@@ -114,12 +114,10 @@ struct Machine {
   Expr fix_body(Expr head, const struct FixRule* r, const struct FixArm* arm);
 };
 
-extern int g_engine;   // 0 = substitution reference, 1 = lazy machine, 2 = both (differential check)
 extern u64 g_kam_steps;
 void free_closed_thunks(void* m);
 long kam_last_call();
 extern long g_trace_call;   // LL_TRACE_CALL; -2 traces every machine call
-extern int g_memo;   // memoise delayed applications by their read-back (LL_MEMO=1 / --memo)
 extern u64 g_k_memo_hit, g_k_memo_ins;
 extern std::unordered_map<u32, u64> g_delta_hist, g_iota_hist;
 extern std::unordered_map<Expr, long> g_peak_by_term, g_peak_by_head;

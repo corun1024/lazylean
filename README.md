@@ -14,8 +14,8 @@ machine's result. The checks on inductive types, quotients and fixpoint rules as
 checker for types, weak-head normal forms and definitional equality.
 
 On the Lean Kernel Arena's ranking measure, the instructions executed to check all of Mathlib,
-lazylean 0.5.0 needs 0.54 × 10¹² instructions for 654 504 declarations, on one core, in about
-four and a half minutes, and at most 4.7 GB of memory: a quarter fewer instructions than the fastest
+lazylean 0.5.1 needs 0.48 × 10¹² instructions for 654 504 declarations, on one core, in about
+four and a half minutes, and at most 4.7 GB of memory: a third fewer instructions than the fastest
 checker of the 2026-09 round, less memory than any of them, and ten times fewer instructions
 than lazylean 0.3.0. On the Four Colour Theorem's 201 672-declaration dependency closure the
 lazy machine needs 3.9 core-hours where Lean's kernel needs 7.5, and where Lean's kernel dies at
@@ -110,7 +110,8 @@ not be compared once the arguments before them agree) and whether an application
 all (then proof irrelevance needs no type inference).
 
 **Two sessions, one checker.** Ordinary declarations are checked in the main session, whose
-values and caches are shared by thousands of declarations. A declaration that takes more than a
+values and caches are shared by the declarations that follow it, until the session's memory is
+used up (about fifty declarations at a time on Mathlib). A declaration that takes more than a
 million evaluation steps there, or allocates more than 64 MB of values, is one that computes: it
 is checked again, by the same checker, in a scratch session that is emptied afterwards, with the
 lazy machine reducing every closed term the checker would otherwise unfold step by step. The
@@ -324,17 +325,17 @@ on the Mathlib export; its time columns are that count divided by 6 × 10⁹. Wa
 enter the ranking, and neither does the number of cores, which is why 0.4 runs as a single
 process. Billions of instructions, all declarations accepted in every run:
 
-| corpus | declarations | lazylean 0.3.0 | mathgraph | sokonanoda | nanoclo | Lean's kernel | lazylean 0.4.1 | lazylean 0.4.2 | lazylean 0.5.0 |
-|---|---|---|---|---|---|---|---|---|---|
-| Init | 53 093 | 213 | 37 | 39 | 121 | 367 | 21 | 27 | **29** |
-| Std | 90 778 | 351 | 62 | 65 | 201 | 617 | 36 | 47 | **48** |
-| con-leche | 26 819 | 457 | 157 | 162 | 315 | 665 | 75 | 108 | **92** |
-| CSLib | 370 939 | 1 248 | 237 | 249 | 775 | 2 428 | 141 | 174 | **183** |
-| Mathlib | 654 504 | 5 529 | 709 | 745 | 3 064 | 11 832 | 464 | 519 | **543** |
+| corpus | declarations | lazylean 0.3.0 | mathgraph | sokonanoda | nanoclo | Lean's kernel | lazylean 0.4.1 | lazylean 0.4.2 | lazylean 0.5.0 | lazylean 0.5.1 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Init | 53 093 | 213 | 37 | 39 | 121 | 367 | 21 | 27 | 29 | **25** |
+| Std | 90 778 | 351 | 62 | 65 | 201 | 617 | 36 | 47 | 48 | **43** |
+| con-leche | 26 819 | 457 | 157 | 162 | 315 | 665 | 75 | 108 | 92 | **82** |
+| CSLib | 370 939 | 1 248 | 237 | 249 | 775 | 2 428 | 141 | 174 | 183 | **164** |
+| Mathlib | 654 504 | 5 529 | 709 | 745 | 3 064 | 11 832 | 464 | 519 | 543 | **484** |
 
 Peak memory (resident set, GB, as the arena measures it with GNU `time`):
 
-| corpus | lowest other checker in 2026-09 | mathgraph | sokonanoda | Lean's kernel | lazylean 0.4.1 | lazylean 0.4.2 | lazylean 0.5.0 |
+| corpus | lowest other checker in 2026-09 | mathgraph | sokonanoda | Lean's kernel | lazylean 0.4.1 | lazylean 0.4.2 | lazylean 0.5.1 |
 |---|---|---|---|---|---|---|---|
 | Init | 0.43 (still-nanoda) | 0.60 | 0.72 | 0.56 | 4.0 | 0.39 | **0.41** |
 | Std | 0.68 (still-nanoda) | 0.92 | 1.06 | 0.92 | 4.9 | 0.64 | **0.60** |
@@ -349,7 +350,11 @@ one kernel (above) at about the same cost: on Mathlib 90 s of the arena's virtua
 118 s for the round's fastest checker, and 4.71 GB at the peak. It gives back 3 to 5% on the
 libraries, where the checks on inductive types now go through the evaluator's term-level
 interface rather than a checker of their own, and gains 15% on con-leche, whose proofs more than
-64 binders deep the evaluator now caches properly.
+64 binders deep the evaluator now caches properly. 0.5.1 removes every tuning switch (each run
+takes the same code paths) and is about 11% cheaper throughout: the evaluator's hash tables no
+longer recompute their load limit on every lookup, the common cases of evaluation, inference and
+application (a variable, a constant, a cache hit) are answered inline, and pruned environments
+are built with less hashing. Memory is unchanged (0.5.1's figures are in the second table).
 
 Where the memory went in 0.4.2, on Mathlib: expression nodes shrink from 40 to 32 bytes (a
 32-bit hash), and the permanent intern index stores 4-byte handles rather than 8-byte
@@ -568,10 +573,17 @@ lazylean --shard 3/8 export.ndjson           check every 8th declaration startin
 lazylean --max-rss 12000 export.ndjson       fail a declaration that exceeds 12 GB instead of
                                              letting the process be killed
 lazylean --progress p.txt export.ndjson      rewrite a one-line status file per declaration
-lazylean --memo export.ndjson                memoise open applications by their read-back
-                                             (the Four Colour Theorem's certificates want this)
 lazylean --print Nat.add export.ndjson       print a declaration's type and value
+lazylean --only Foo.bar export.ndjson        check one declaration (the others are added unchecked)
+lazylean --trust-file t.txt export.ndjson    add the declarations named in t.txt unchecked
+                                             (to resume a long run; the count is reported)
 ```
+
+There are no tuning switches: every run takes the same code paths. Statistics go to standard
+error at the end of a run. The `LL_*` environment variables that remain only print diagnostics
+(`LL_MEMREPORT`, `LL_NBE_TRACE`, `LL_FIX_TRACE`, `LL_FUSE_TRACE`, `LL_HIST` and the machine's
+`LL_TRACE_*`), or serve a profiler (`LL_EXIT_NORMAL`) or a system without transparent huge pages
+(`LL_NO_HUGEPAGES`).
 
 To produce an export: `lean4export Module -- decl > out.ndjson` from the
 [lean4export](https://github.com/leanprover/lean4export) tool, at the toolchain version of the

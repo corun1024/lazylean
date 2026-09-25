@@ -56,8 +56,7 @@ void* big_alloc(size_t bytes) {
   if (a > p) munmap(p, a - p);
   if (a + bytes < p + bytes + H) munmap(a + bytes, (p + bytes + H) - (a + bytes));
   madvise(a, bytes, MADV_HUGEPAGE);
-  static const bool populate = !getenv("LL_NBE_NOPOPULATE");
-  if (populate) madvise(a, bytes, MADV_POPULATE_WRITE);   // fault it all in with one call
+  madvise(a, bytes, MADV_POPULATE_WRITE);   // fault it all in with one call
   return a;
 }
 void big_free(void* p, size_t bytes) { const size_t H = (size_t)2 << 20; if (p) munmap(p, (bytes + H - 1) & ~(H - 1)); }
@@ -104,21 +103,25 @@ struct Arena {
 };
 
 // Open-addressing map keyed by a pair of u64 (first component never 0).
+// Open-addressing map keyed by a pair of u64 (first component never 0).
 template <class V> struct PMap {
-  // Open addressing with linear probing.
+  // Open addressing with linear probing.  The slot is the top bits of one multiplication (the
+  // keys are pointers and handles: their low bits vary, and a product's high bits depend on
+  // every bit of the factor); a table grows past three quarters full.
   struct S { u64 a, b; V v; };
-  S* t = nullptr; size_t mask = 0, n = 0, gen = 0;   // gen: bumped when the table moves
-  static size_t hs(u64 a, u64 b) {
-    u64 h = (a ^ (b * 0x9E3779B97F4A7C15ull)) * 0xBF58476D1CE4E5B9ull;
-    return (size_t)(h ^ (h >> 29));
+  S* t = nullptr; size_t mask = 0, n = 0, gen = 0, lim = 0;   // gen: bumped when the table moves
+  unsigned shift = 64;
+  size_t hs(u64 a, u64 b) const {
+    return (size_t)(((a ^ ((b << 32) | (b >> 32))) * 0x9E3779B97F4A7C15ull) >> shift);
   }
   static constexpr size_t BIG = 1 << 16;   // slots; tables at least this large live in mmap'd memory
   static S* alloc_tab(size_t nc) { return nc >= BIG ? (S*)big_alloc(nc * sizeof(S)) : (S*)calloc(nc, sizeof(S)); }
   static void free_tab(S* p, size_t nc) { if (!p) return; if (nc >= BIG) big_free(p, nc * sizeof(S)); else free(p); }
+  void set_cap(size_t nc) { mask = nc - 1; lim = nc / 4 * 3; shift = 64 - (unsigned)__builtin_ctzll(nc); }
   ~PMap() { free_tab(t, t ? mask + 1 : 0); }
   V* find(u64 a, u64 b) {
     if (!n) return nullptr;
-    size_t i = hs(a, b) & mask;
+    size_t i = hs(a, b);
     while (true) {
       S& s = t[i];
       if (s.a == a && s.b == b) return &s.v;
@@ -128,17 +131,17 @@ template <class V> struct PMap {
   }
   void grow() {
     size_t oc = t ? mask + 1 : 0, nc = oc ? oc * 2 : 256;
-    S* old = t; t = alloc_tab(nc); mask = nc - 1; gen++;
+    S* old = t; t = alloc_tab(nc); set_cap(nc); gen++;
     for (size_t j = 0; j < oc; j++) if (old[j].a) {
-      size_t i = hs(old[j].a, old[j].b) & mask;
+      size_t i = hs(old[j].a, old[j].b);
       while (t[i].a) i = (i + 1) & mask;
       t[i] = old[j];
     }
     free_tab(old, oc);
   }
   V& put(u64 a, u64 b, V v) {
-    if (!t || (n + 1) * 4 > (mask + 1) * 3) grow();
-    size_t i = hs(a, b) & mask;
+    if (n >= lim) grow();
+    size_t i = hs(a, b);
     while (true) {
       S& s = t[i];
       if (s.a == a && s.b == b) { s.v = v; return s.v; }
@@ -149,8 +152,8 @@ template <class V> struct PMap {
   // Find the entry for (a, b), or create it (value zeroed) if absent; `created` says which.
   // The pointer is valid until the next insertion.
   V* slot(u64 a, u64 b, bool& created) {
-    if (!t || (n + 1) * 4 > (mask + 1) * 3) grow();
-    size_t i = hs(a, b) & mask;
+    if (n >= lim) grow();
+    size_t i = hs(a, b);
     while (true) {
       S& s = t[i];
       if (s.a == a && s.b == b) { created = false; return &s.v; }
@@ -164,7 +167,7 @@ template <class V> struct PMap {
     size_t cap = mask + 1;
     if (cap >= BIG && n * 8 < cap) {   // far larger than this session needed: give memory back
       size_t nc = BIG; while (n * 2 > nc) nc *= 2;
-      free_tab(t, cap); t = alloc_tab(nc); mask = nc - 1; n = 0; gen++;
+      free_tab(t, cap); t = alloc_tab(nc); set_cap(nc); n = 0; gen++;
       return;
     }
     memset(t, 0, cap * sizeof(S)); n = 0;
@@ -211,8 +214,8 @@ Val g_stuck_obj;
 Val* const STUCK = &g_stuck_obj;
 Val g_unused;
 extern size_t g_session_bytes;
-const size_t g_decl_arena = getenv("LL_NBE_DECL_MB") ? (size_t)atol(getenv("LL_NBE_DECL_MB")) << 20 : (size_t)64 << 20;   // the main session's allocation budget per declaration
-const u64 g_nbe_budget = getenv("LL_NBE_BUDGET") ? strtoull(getenv("LL_NBE_BUDGET"), nullptr, 10) : 1000000;
+const size_t g_decl_arena = (size_t)64 << 20;   // the main session's allocation budget per declaration
+const u64 g_nbe_budget = 1000000;              // and its step budget
 u64 s_hist[8] = {0};   // declarations by steps: <1e3, <1e4, .. <1e9, more   // stands for an argument whose variable the term it is bound in never mentions
 
 // The expression table can grow while the engine runs (the term-level interface reads terms
@@ -283,15 +286,16 @@ struct Engine {
     if (ar.bytes > arena0 + decl_arena) nfail("memory budget");
   }
 
+  u64 sess_no = 0;   // this engine's sessions (prune_dm entries carry it)
   bool scratch_session = false;   // emptied after every use: keeps one arena block, not a session's worth
   void start_session(bool trim = true) {
     ar.reset(scratch_session ? 0 : g_session_bytes);
     c_head.clear(); c_type.clear(); c_unfold.clear(); c_rule.clear(); c_eval.clear(); c_env.clear();
     c_bvar.clear(); c_app.clear(); c_lit.clear(); c_vtype.clear(); c_lvl.clear(); c_lsub.clear();
-    c_pos.clear(); c_neg.clear(); c_isprop.clear(); c_infer.clear(); c_frame.clear(); c_fvar.clear(); c_closed.clear(); memset(prune_dm, 0, sizeof(PruneDM) << PRUNE_DM_BITS);
+    c_pos.clear(); c_neg.clear(); c_isprop.clear(); c_infer.clear(); c_frame.clear(); c_fvar.clear(); c_closed.clear();
     nats.clear(); lsubs.clear();
     groot = ar.make<Env>();
-    s_sessions++;
+    s_sessions++; sess_no++;
     if (trim) malloc_trim(0);   // hand back what earlier declarations freed (the export's copies of constants)
   }
 
@@ -441,8 +445,8 @@ struct Engine {
     // with different variable sets are evaluated in turn
     PruneDM& dm = prune_dm[(((u64)env * 0x9E3779B97F4A7C15ull) ^ (m * 0xD6E8FEB86659FD93ull)) >> (64 - PRUNE_DM_BITS)];
     Env* f;
-    if (dm.env == env && dm.mask == m) f = dm.frame;
-    else { f = prune(env, m); dm.env = env; dm.mask = m; dm.frame = f; }
+    if (dm.env == env && dm.mask == m && dm.sess == sess_no) f = dm.frame;
+    else { f = prune(env, m); dm.env = env; dm.mask = m; dm.frame = f; dm.sess = sess_no; }
     env->pm = m; env->pr = f;
     return f;
   }
@@ -500,27 +504,32 @@ struct Engine {
     return out.ok;
   }
   static constexpr unsigned PRUNE_DM_BITS = 16;
-  struct PruneDM { Env* env; u64 mask; Env* frame; };
+  struct PruneDM { Env* env; u64 mask; Env* frame; u64 sess; };   // sess: entries of earlier sessions are stale
   PruneDM* prune_dm = (PruneDM*)calloc((size_t)1 << PRUNE_DM_BITS, sizeof(PruneDM));
   __attribute__((noinline)) Env* prune(Env* env, u64 m) {
     Val* vs[64]; u32 k = 0;
-    u64 h = mix((u64)root_of(env), m);
+    u64 h = (u64)root_of(env) ^ m;   // a multiply-add per value; PMap mixes the result
     Env* c = env; u32 off = 0;
     for (u64 mm = m; mm; mm &= mm - 1) {
       u32 i = (u32)__builtin_ctzll(mm);
       while (!c->frame && off < i) { c = c->parent; off++; }
-      Val* v = c->frame ? lookup(c, i - off) : c->v;
-      if (!c->frame && off != i) nfail("prune");
-      vs[k++] = v; h = mix(h, (u64)v);
+      Val* v;
+      if (c->frame) v = lookup(c, i - off);
+      else { if (off != i) nfail("prune"); v = c->v; }
+      vs[k++] = v; h = (h + (u64)v) * 0xD6E8FEB86659FD93ull;
     }
     bool created; Env** slot = c_frame.slot(h | 1, m, created);
     if (!created) {
       Env* f = *slot;
-      if (f->ls == env->ls && memcmp(f->v, vs, k * sizeof(Val*)) == 0) return f;
+      if (f->ls == env->ls) {
+        Val** fv = (Val**)f->v; u32 j = 0;
+        while (j < k && fv[j] == vs[j]) j++;
+        if (j == k) return f;
+      }
     }
     Env* f = ar.make<Env>();
     Val** sl = (Val**)ar.alloc(k * sizeof(Val*));
-    memcpy(sl, vs, k * sizeof(Val*));
+    for (u32 j = 0; j < k; j++) sl[j] = vs[j];
     f->v = (Val*)sl; f->ls = env->ls; f->frame = 1; f->mask = m; f->len = 64 - (u32)__builtin_clzll(m);
     if (created) *slot = f;
     return f;
@@ -637,24 +646,40 @@ struct Engine {
     return eval(s ? s->root : groot, e);
   }
 
-  Val* eval(Env* env, Expr e) {
-    const ExprNode n = node(e);
-    switch (n.kind) {
-      case EKind::BVar: return lookup(env, n.a);
-      case EKind::Sort: return mk_sort(inst_level(env->ls, n.a));
-      case EKind::Const: KC(k_const); if (!env->ls) return const_head(n.name, n.lvls); break;
-      case EKind::Lit: return lit_val(e, n);
-      case EKind::FVar: return fvar_val(n.a);
-      case EKind::Clos: return eval(env, expand_closures(e));   // a suspended substitution from the term-level interface
+  // The leaves (a variable, a constant) are answered inline at the call; everything else goes
+  // through the evaluation cache out of line.
+  __attribute__((always_inline)) Val* eval(Env* env, Expr e) {
+    const ExprNode* np = &g_node_base[e];
+    switch (np->kind) {
+      case EKind::BVar: return lookup(env, np->a);
+      case EKind::Const: if (!env->ls) { KC(k_const); return const_head(np->name, np->lvls); } break;
+      case EKind::App: case EKind::Lam: case EKind::Pi: case EKind::Let: case EKind::Proj:
+        if (!(np->flags & 1)) return eval_cached(env, e);
+        break;
       default: break;
     }
-    // A term with a free variable is not cached: variable ids are reused once a scope closes.
-    if (n.flags & 1) return eval_slow(env, e, env, nullptr);
+    return eval_other(env, e);
+  }
+  __attribute__((noinline)) Val* eval_cached(Env* env, Expr e) {
     Env* ke = key_env(env, e);
     KC(k_eval);
     bool created; Val** slotp = c_eval.slot((u64)ke, e, created);
     if (!created && *slotp) { KC(k_eval_hit); return *slotp; }
     return eval_slow(env, e, ke, slotp);
+  }
+  __attribute__((noinline)) Val* eval_other(Env* env, Expr e) {
+    const ExprNode n = node(e);
+    switch (n.kind) {
+      case EKind::Sort: return mk_sort(inst_level(env->ls, n.a));
+      case EKind::Lit: return lit_val(e, n);
+      case EKind::FVar: return fvar_val(n.a);
+      case EKind::Clos: return eval(env, expand_closures(e));   // a suspended substitution from the term-level interface
+      default: break;
+    }
+    // (a constant under a level substitution goes through the cache.)  A term with a free
+    // variable is not cached: variable ids are reused once a scope closes.
+    if (n.flags & 1) return eval_slow(env, e, env, nullptr);
+    return eval_cached(env, e);
   }
   // the cache missed: evaluate, and fill the reserved slot
 #ifdef LL_NBE_STATS
@@ -712,7 +737,11 @@ struct Engine {
            n == N.Nat_shiftLeft || n == N.Nat_shiftRight;
   }
 
-  Val* apply(Val* f, Val* a) {
+  __attribute__((always_inline)) Val* apply(Val* f, Val* a) {
+    if (f->k == V_NEU && a->k != V_NAT) return neu_app(f, (u64)a);   // the common case
+    return apply_other(f, a);
+  }
+  __attribute__((noinline)) Val* apply_other(Val* f, Val* a) {
     switch (f->k) {
       case V_LAM: return eval(extend(f->lam.env, a), f->lam.body);
       case V_NEU:
@@ -1204,8 +1233,7 @@ struct Engine {
   }
   // 1: statically a proof, 0: statically not a proof, -1: unknown
   int static_proof(Val* v) {
-    static const bool off = getenv("LL_NBE_NOSTATIC") != nullptr;
-    if (off || v->k != V_NEU || v->hk == H_BVAR || v->hk == H_FVAR) return -1;
+    if (v->k != V_NEU || v->hk == H_BVAR || v->hk == H_FVAR) return -1;
     Spine* sp = v->n.sp;
     if (sp && sp->nproj) return -1;
     u32 k = sp ? sp->len : 0;
@@ -1233,7 +1261,31 @@ struct Engine {
     if (cache) { if (r) c_pos.put(ka, kb, 1); else if (!exhausted) c_neg.put(ka, kb, 1); }
     return r;
   }
+  // Two closures of the same terms whose environments give the variables those terms mention
+  // the same values (the same pointers) are the same function or type.
+  bool same_closure(Val* x, Val* y) {
+    Env *ex, *ey; Expr bx, by; u64 m;
+    if (x->k == V_LAM) {
+      if (x->lam.body != y->lam.body || x->lam.dom != y->lam.dom) return false;
+      ex = x->lam.env; ey = y->lam.env; bx = x->lam.body; by = x->lam.dom;
+      m = fv_mask(by);
+    } else {
+      if (x->pinf != y->pinf || x->pi.body != y->pi.body) return false;
+      ex = x->pi.env; ey = y->pi.env; bx = x->pi.body;
+      if (x->pi.dom && x->pi.dom == y->pi.dom) m = 0;
+      else if (!x->pi.dom && !y->pi.dom && x->pi.dome == y->pi.dome) m = fv_mask(x->pi.dome);
+      else return false;
+    }
+    if (ex == ey) return true;
+    if (ex->ls != ey->ls || bx >= fvm_n || m == ~0ull) return false;
+    u64 mb = fv_mask(bx);
+    if (mb == ~0ull) return false;
+    m |= mb >> 1;
+    for (; m; m &= m - 1) { u32 i = (u32)__builtin_ctzll(m); if (lookup(ex, i) != lookup(ey, i)) return false; }
+    return true;
+  }
   bool conv_binder(u32 d, Val* x, Val* y) {
+    if (same_closure(x, y)) return true;
     Val* dx = x->k == V_LAM ? lam_dom(x) : pi_dom(x);
     Val* dy = y->k == V_LAM ? lam_dom(y) : pi_dom(y);
     if (!conv(d, dx, dy)) return false;
@@ -1274,8 +1326,7 @@ struct Engine {
     return true;
   }
   u64 skip_mask(Val* x) {
-    static const bool off = getenv("LL_NBE_NOSKIP") != nullptr;
-    if (off || x->k != V_NEU || x->hk == H_BVAR || x->hk == H_FVAR) return 0;
+    if (x->k != V_NEU || x->hk == H_BVAR || x->hk == H_FVAR) return 0;
     return sig_of(x->a, x->n.ls)->arg_prop;
   }
   bool probe_spine(u32 d, Spine* a, Spine* b, u64 skip) {
@@ -1408,10 +1459,28 @@ struct Engine {
     return s->a;
   }
 
-  Val* infer(bool chk, Env* env, u32 d, Expr e) {
+  // As eval: a variable inline, a composite term through the cache out of line, the rest apart.
+  __attribute__((always_inline)) Val* infer(bool chk, Env* env, u32 d, Expr e) {
+    const ExprNode* np = &g_node_base[e];
+    switch (np->kind) {
+      case EKind::BVar: return value_type(d, lookup(env, np->a));
+      case EKind::App: case EKind::Lam: case EKind::Pi: case EKind::Let: case EKind::Proj:
+        if (!(np->flags & 1)) return infer_cached(chk, env, d, e);
+        break;
+      default: break;
+    }
+    return infer_other(chk, env, d, e);
+  }
+  __attribute__((noinline)) Val* infer_cached(bool chk, Env* env, u32 d, Expr e) {
+    Env* ke = key_env(env, e);
+    IEnt* ce = c_infer.find((u64)ke, e);
+    KC(k_infer);
+    if (ce && (!chk || ce->scope == scope)) { KC(k_infer_hit); return ce->ty; }
+    return infer_slow(chk, env, d, e, ke, true);
+  }
+  __attribute__((noinline)) Val* infer_other(bool chk, Env* env, u32 d, Expr e) {
     const ExprNode n = node(e);
     switch (n.kind) {
-      case EKind::BVar: return value_type(d, lookup(env, n.a));
       case EKind::Sort:
         if (chk) check_level(n.a);
         return mk_sort(mk_succ(inst_level(env->ls, n.a)));
@@ -1435,12 +1504,7 @@ struct Engine {
       case EKind::Clos: return infer(chk, env, d, expand_closures(e));
       default: break;
     }
-    if (n.flags & 1) return infer_slow(chk, env, d, e, env, false);
-    Env* ke = key_env(env, e);
-    IEnt* ce = c_infer.find((u64)ke, e);
-    KC(k_infer);
-    if (ce && (!chk || ce->scope == scope)) { KC(k_infer_hit); return ce->ty; }
-    return infer_slow(chk, env, d, e, ke, true);
+    return infer_slow(chk, env, d, e, env, false);   // a term with a free variable: not cached
   }
   __attribute__((noinline)) Val* infer_slow(bool chk, Env* env, u32 d, Expr e, Env* ke, bool cache) {
     const ExprNode n = node(e);
@@ -1591,7 +1655,7 @@ struct Engine {
   Val* machine_whnf(Val* v) {
     Expr q = quote(0, v);
     // fused first, as the machine unfolds definitions (fusion may itself reduce the term)
-    Expr e = g_fuse ? fuse_term(*E, mctx->fuse_cache, q) : q;
+    Expr e = fuse_term(*E, mctx->fuse_cache, q);
     Machine m(*mctx);
     Expr r = m.whnf(e, true);
     if (r == q) return nullptr;
@@ -1636,8 +1700,7 @@ struct Engine {
 
 Engine* g_engine_nbe = nullptr;   // the main session: declarations that do not compute
 Engine* g_scratch = nullptr;      // declarations that need terms of their own, and those that compute
-size_t g_session_bytes = getenv("LL_NBE_SESSION_MB") ? (size_t)atol(getenv("LL_NBE_SESSION_MB")) << 20 : (size_t)128 << 20;
-bool g_session_fixed = getenv("LL_NBE_SESSION_MB") != nullptr;
+size_t g_session_bytes = (size_t)128 << 20;
 
 } // namespace
 
@@ -1803,7 +1866,6 @@ void check_decl(Environment& env, Decl& d) {
 // A session's size follows the export's: about a 44th of the file, between 32 and 128 MB.  A
 // small export does not need long sessions to share its constants, and memory stays low.
 void nbe_size_sessions(size_t export_bytes) {
-  if (g_session_fixed) return;
   size_t want = export_bytes / 44;
   g_session_bytes = std::min(std::max(want, (size_t)32 << 20), (size_t)128 << 20);
 }
