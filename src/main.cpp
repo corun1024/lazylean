@@ -2,6 +2,10 @@
 #include "kam.h"
 #include "fuse.h"
 #include "fix.h"
+#include "nbe.h"
+#ifdef LL_CALLGRIND
+#include <valgrind/callgrind.h>
+#endif
 #include <iostream>
 #include <chrono>
 #include <thread>
@@ -40,6 +44,7 @@ struct Options {
   std::string only;      // check only this declaration (others added unchecked)
   std::string stop_at;   // stop after this declaration
   long from_line = 0;    // declarations before this line are added without checking
+  long count = 0;        // stop after checking this many declarations (0: no limit)
   unsigned shard = 0, nshards = 1;   // check only declarations with index % nshards == shard
   unsigned jobs = 1;     // worker processes, forked after the export is parsed
 };
@@ -267,32 +272,40 @@ static int run(const Options& opt) {
     std::cerr << "trusting " << trusted.size() << " named declarations (added unchecked)\n";
   }
   for (const Decl& d : ef.decls) {
-    std::string nm = name_str(d.consts[0].name);
+    // the declaration's name as a string, built only when something needs it
+    std::string nm_s; bool nm_ok = false;
+    auto nm = [&]() -> const std::string& { if (!nm_ok) { nm_s = name_str(d.consts[0].name); nm_ok = true; } return nm_s; };
     bool check = true;
     size_t my_index = di++;
     if (opt.nshards > 1 && (my_index % opt.nshards) != opt.shard) check = false;
     // one worker per declaration: whoever reaches it first takes it
     if (check && g_shared && g_shared->claim[my_index].exchange(1) != 0) check = false;
     if (g_shared && g_shared->stop.load(std::memory_order_relaxed)) break;   // another worker rejected
-    if (!opt.only.empty() && nm != opt.only) check = false;
-    if (!trusted.empty() && trusted.count(nm)) check = false;
+    if (!opt.only.empty() && nm() != opt.only) check = false;
+    if (!trusted.empty() && trusted.count(nm())) check = false;
     if (opt.from_line && (long)d.line < opt.from_line) check = false;
     double s = now();
     if (check && !opt.progress.empty()) {
       FILE* pf = fopen(g_worker >= 0 ? (opt.progress + "." + std::to_string(g_worker)).c_str() : opt.progress.c_str(), "w");
-      if (pf) { fprintf(pf, "%zu/%zu line %zu ok %zu failed %zu elapsed %.0fs\n%s\n", my_index, ef.decls.size(), d.line, ok, failed, now() - t1, nm.c_str()); fclose(pf); }
+      if (pf) { fprintf(pf, "%zu/%zu line %zu ok %zu failed %zu elapsed %.0fs\n%s\n", my_index, ef.decls.size(), d.line, ok, failed, now() - t1, nm().c_str()); fclose(pf); }
     }
+#ifdef LL_CALLGRIND
+    { static bool on = false; if (check && !on) { on = true; CALLGRIND_START_INSTRUMENTATION; } }
+#endif
     try {
       if (check) {
         if (prebuilt) for (const ConstInfo& c : d.consts) env.hide(c.name);   // let check_and_add add them
         size_t mark = env.mark();
-        try {
+        if (g_nbe && nbe_check(env, d)) {
+          // accepted by the evaluation engine; anything it declines is checked below
+          env.add(d.consts[0]);
+        } else try {
           if (two_attempts) { g_fuse = 0; g_fix = 0; g_step_budget = fuse_budget; } g_decl_work = 0; g_decl_wrap = 0;
           u64 d0 = g_k_delta, i0 = g_k_iota, s0 = st.steps;
           check_and_add(env, d, opt.trust_inductives, st);
           static const long rep = getenv("LL_WORK_REPORT") ? atol(getenv("LL_WORK_REPORT")) : -1;
           if (rep >= 0 && (long)(st.steps - s0) >= rep)
-            std::cerr << "WORK " << nm << " steps " << (st.steps - s0) << " delta " << (g_k_delta - d0)
+            std::cerr << "WORK " << nm() << " steps " << (st.steps - s0) << " delta " << (g_k_delta - d0)
                       << " wrapper " << g_decl_wrap << " iota " << (g_k_iota - i0) << "\n";
         } catch (NeedsFusion&) {
           // it computes: throw the attempt away and check it again with fusion and rules on
@@ -312,7 +325,7 @@ static int run(const Options& opt) {
     } catch (KernelError& e) {
       g_fuse = fuse_default; g_fix = fix_default; g_step_budget = 0;
       failed++;
-      std::cerr << "FAIL " << nm << " (line " << d.line << "): " << e.what() << "\n";
+      std::cerr << "FAIL " << nm() << " (line " << d.line << "): " << e.what() << "\n";
       if (!opt.keep_going) {
         if (g_shared) g_shared->stop.store(1, std::memory_order_relaxed);
         if (g_worker >= 0) worker_exit(ok, failed, unchecked, st.steps, peak_exprs, now() - t1);
@@ -331,15 +344,18 @@ static int run(const Options& opt) {
     g_exprs->reclaim();
     fix_after_reclaim();
     g_lctx.decls.clear();
-    if (dt > opt.slow) slow.emplace_back(dt, nm);
-    if (opt.verbose) std::cerr << (check ? "ok   " : "skip ") << nm << " " << dt << "s\n";
-    if (!opt.stop_at.empty() && nm == opt.stop_at) break;
+    nbe_between_decls();
+    if (dt > opt.slow) slow.emplace_back(dt, nm());
+    if (opt.verbose) std::cerr << (check ? "ok   " : "skip ") << nm() << " " << dt << "s\n";
+    if (!opt.stop_at.empty() && nm() == opt.stop_at) break;
+    if (opt.count && (long)(ok + failed) >= opt.count) break;
   }
   double t2 = now();
   if (g_worker >= 0) worker_exit(ok, failed, unchecked, st.steps, peak_exprs, t2 - t1);
   std::cerr << "checked " << ok << " declarations, " << failed << " failed, " << unchecked << " added unchecked, in "
             << (t2 - t1) << "s; " << st.steps << " reduction steps; " << g_exprs->size() << " exprs live"
             << (g_engine == 2 ? "; engine mismatches: " + std::to_string(g_engine_mismatches) : std::string("")) << "\n";
+  nbe_report();
   std::cerr << "counters: defeq " << g_cnt_defeq << " (quick " << g_cnt_defeq_quick << ", proof-irrel " << g_cnt_pi << ", lazy " << g_cnt_lazy << ", binding " << g_cnt_binding
             << "); infer " << g_cnt_infer << " (hit " << g_cnt_infer_hit << "); whnf " << g_cnt_whnf << " (hit " << g_cnt_whnf_hit << "); whnf_core " << g_cnt_whnfcore << " (hit " << g_cnt_whnfcore_hit << ")\n";
   if (getenv("LL_COUNT_REPEATS")) std::cerr << "defeq pairs compared again: " << g_cnt_defeq_repeat << " (of which previously failed: " << g_cnt_defeq_refail << ")\n";
@@ -391,6 +407,7 @@ int main(int argc, char** argv) {
     else if (a == "--only" && i + 1 < argc) opt.only = argv[++i];
     else if (a == "--stop-at" && i + 1 < argc) opt.stop_at = argv[++i];
     else if (a == "--from-line" && i + 1 < argc) opt.from_line = atol(argv[++i]);
+    else if (a == "--count" && i + 1 < argc) opt.count = atol(argv[++i]);
     else if (a == "--slow" && i + 1 < argc) opt.slow = atof(argv[++i]);
     else if (a == "--max-depth" && i + 1 < argc) opt.max_depth = atoi(argv[++i]);
     else if (a == "--max-rss" && i + 1 < argc) opt.max_rss_mb = atol(argv[++i]);   // MB
