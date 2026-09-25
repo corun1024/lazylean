@@ -334,8 +334,8 @@ struct Engine {
     KC(k_env);
     bool created; Val** c = c_env.slot((u64)p, (u64)v, created);
     if (!created) { KC(k_env_hit); return (Env*)*c; }
-    Env* e = ar.make<Env>();
-    e->parent = p; e->v = v; e->ls = p->ls; e->len = p->len + 1;
+    Env* e = (Env*)ar.alloc(sizeof(Env));   // every field is written below
+    e->parent = p; e->v = v; e->ls = p->ls; e->len = p->len + 1; e->frame = 0; e->mask = 0; e->pm = 0; e->pr = nullptr;
     *c = (Val*)e;
     return e;
   }
@@ -485,13 +485,15 @@ struct Engine {
     bool created; Val** c = c_app.slot((u64)f, e, created);
     if (!created) { KC(k_app_hit); return *c; }
     struct VS { Val v; Spine s; };
-    VS* vs = ar.make<VS>();
+    VS* vs = (VS*)ar.alloc(sizeof(VS));   // every field is written below
     Val* v = &vs->v; *c = v;
-    v->k = V_NEU; v->hk = f->hk; v->a = f->a; v->n.ls = f->n.ls; v->n.bty = f->n.bty;
     Spine* s = &vs->s;
-    s->prev = f->n.sp; s->e = e; s->len = (f->n.sp ? f->n.sp->len : 0) + 1;
-    s->nproj = (f->n.sp ? f->n.sp->nproj : 0) + (is_proj_elim(e) ? 1 : 0);
-    v->n.sp = s;
+    Spine* fp = f->n.sp;
+    s->prev = fp; s->e = e;
+    s->len = (fp ? fp->len : 0) + 1;
+    s->nproj = (fp ? fp->nproj : 0) + (u32)(e & 1);
+    v->k = V_NEU; v->hk = f->hk; v->pinf = 0; v->pad = 0; v->a = f->a;
+    v->n.ls = f->n.ls; v->n.sp = s; v->n.bty = f->n.bty; v->n.red = nullptr; v->n.whnf = nullptr;
     return v;
   }
   // eliminations of a spine, oldest first
@@ -530,7 +532,7 @@ struct Engine {
   }
   // the cache missed: evaluate, and fill the reserved slot
 #ifdef LL_NBE_STATS
-  int ectx = 0; u64 ectx_miss[8] = {0};
+  int ectx = 0; u64 ectx_miss[16] = {0};
   struct ECtx { Engine& g; int s; ECtx(Engine& e, int c) : g(e), s(e.ectx) { if (!g.ectx) g.ectx = c; } ~ECtx() { g.ectx = s; } };
 #define ECTX(c) ECtx ectx_guard(*this, c)
 #else
@@ -649,6 +651,7 @@ struct Engine {
     return infer(false, e2, d, p->pi.body);
   }
   Val* lam_dom(Val* l) {
+    ECTX(10);
     if (!l->lam.domv) l->lam.domv = eval(l->lam.env, l->lam.dom);
     return l->lam.domv;
   }
@@ -713,6 +716,7 @@ struct Engine {
   // ---- projections
 
   Val* do_proj(Val* v, Name s, u32 idx) {
+    ECTX(12);
     if (v->k == V_STR) v = whnf(0, str_to_ctor(v));
     if (v->k != V_NEU) nfail("projection of a non-structure value");
     if (v->hk == H_CTOR && (!v->n.sp || !v->n.sp->nproj)) {
@@ -1003,6 +1007,7 @@ struct Engine {
     ~ProbeSave() { g.probing = sp; g.exhausted = se; g.probe_left = sl; }
   };
   bool conv_types(u32 d, Val* a, Val* b) {
+    ECTX(13);
     ProbeSave ps(*this);
     return conv(d, a, b);
   }
@@ -1313,12 +1318,12 @@ struct Engine {
           if (tenv) {
             const ExprNode& pn = node(texpr);
             body = pn.b; benv = tenv;
-            dom = chk ? eval(tenv, pn.a) : nullptr;
+            { ECTX(8); dom = chk ? eval(tenv, pn.a) : nullptr; }
           } else {
             Val* p = whnf(d, ft);
             if (p->k != V_PI) nfail("function expected");
             body = p->pi.body; benv = p->pi.env; pinf = p->pinf;
-            dom = chk ? pi_dom(p) : nullptr;
+            { ECTX(8); dom = chk ? pi_dom(p) : nullptr; }
             if (pinf) {   // an inference closure: instantiate it as a value
               if (chk) { Val* at = infer(true, env, d, args[i]); if (!conv_types(d, dom, at)) nfail("application type mismatch"); }
               Val* av; { ECTX(1); av = node(body).loose_bvar_range == 0 ? nullptr : eval(env, args[i]); }
@@ -1339,14 +1344,14 @@ struct Engine {
       }
       case EKind::Lam: {
         if (chk) sort_level(d, infer(true, env, d, n.a));
-        Val* dom = eval(env, n.a);
+        Val* dom; { ECTX(9); dom = eval(env, n.a); }
         if (chk) infer(true, extend(env, fresh(d, dom)), d + 1, n.b);
         r = mk_pi(dom, env, n.b, true);
         break;
       }
       case EKind::Pi: {
         Level l1 = sort_level(d, infer(chk, env, d, n.a));
-        Val* dom = eval(env, n.a);
+        Val* dom; { ECTX(9); dom = eval(env, n.a); }
         Level l2 = sort_level(d + 1, infer(chk, extend(env, fresh(d, dom)), d + 1, n.b));
         r = mk_sort(mk_imax_s(l1, l2));
         break;
@@ -1361,6 +1366,7 @@ struct Engine {
         break;
       }
       case EKind::Proj: {
+        ECTX(14);
         Val* st = infer(chk, env, d, n.b);
         r = proj_type(d, eval(env, n.b), st, n.name, n.a, chk);
         break;
@@ -1377,7 +1383,7 @@ struct Engine {
   // the three phases of checking a definition (separate functions, for profiles)
   __attribute__((noinline)) Val* phase_type(Expr t) { return infer(true, groot, 0, t); }
   __attribute__((noinline)) Val* phase_value(Expr v) { return infer(true, groot, 0, v); }
-  __attribute__((noinline)) bool phase_conv(Val* vt, Expr t) { return conv_types(0, vt, eval(groot, t)); }
+  __attribute__((noinline)) bool phase_conv(Val* vt, Expr t) { Val* tv; { ECTX(11); tv = eval(groot, t); } return conv_types(0, vt, tv); }
   bool check(const Environment& env, const Decl& dcl) {
     if (dcl.kind != Decl::Axiom && dcl.kind != Decl::Def && dcl.kind != Decl::Thm && dcl.kind != Decl::Opaque) return false;
     const ConstInfo& c = dcl.consts[0];
@@ -1421,7 +1427,7 @@ struct Engine {
 };
 
 Engine* g_engine_nbe = nullptr;
-size_t g_session_bytes = getenv("LL_NBE_SESSION_MB") ? (size_t)atol(getenv("LL_NBE_SESSION_MB")) << 20 : (size_t)1024 << 20;
+size_t g_session_bytes = getenv("LL_NBE_SESSION_MB") ? (size_t)atol(getenv("LL_NBE_SESSION_MB")) << 20 : (size_t)1536 << 20;
 
 } // namespace
 
@@ -1446,7 +1452,7 @@ void nbe_report() {
               << " pos " << cap(g.c_pos.mask) << " neg " << cap(g.c_neg.mask) << " vtype " << cap(g.c_vtype.mask) << " frame " << cap(g.c_frame.mask)
               << " arena blocks " << g.ar.blocks.size() * 32 << "\n"; }
   std::cerr << "eval misses by origin: other " << g_engine_nbe->ectx_miss[0] << ", infer-arg " << g_engine_nbe->ectx_miss[1] << ", unfold " << g_engine_nbe->ectx_miss[2]
-            << ", iota " << g_engine_nbe->ectx_miss[3] << ", const-type " << g_engine_nbe->ectx_miss[4] << ", pi-inst " << g_engine_nbe->ectx_miss[5] << ", decl-type " << g_engine_nbe->ectx_miss[6] << ", lambda-type-inst " << g_engine_nbe->ectx_miss[7] << "\n";
+            << ", iota " << g_engine_nbe->ectx_miss[3] << ", const-type " << g_engine_nbe->ectx_miss[4] << ", pi-inst " << g_engine_nbe->ectx_miss[5] << ", decl-type " << g_engine_nbe->ectx_miss[6] << ", lambda-type-inst " << g_engine_nbe->ectx_miss[7] << ", app-domain " << g_engine_nbe->ectx_miss[8] << ", binder-domain " << g_engine_nbe->ectx_miss[9] << ", lam-dom " << g_engine_nbe->ectx_miss[10] << ", decl-conv " << g_engine_nbe->ectx_miss[11] << ", proj " << g_engine_nbe->ectx_miss[12] << ", conv " << g_engine_nbe->ectx_miss[13] << ", infer-proj " << g_engine_nbe->ectx_miss[14] << "\n";
 #endif
   std::cerr << "nbe caches (calls/hits): eval " << k_eval << "/" << k_eval_hit << ", app " << k_app << "/" << k_app_hit
             << ", env " << k_env << "/" << k_env_hit << ", infer " << k_infer << "/" << k_infer_hit << ", conv " << k_conv << "/" << k_conv_hit

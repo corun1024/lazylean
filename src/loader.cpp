@@ -64,6 +64,23 @@ struct Loader {
       p += n; return true;
     }
     bool num(u64& v) {
+      // Eight bytes at a time: find the run of digits with byte masks and convert it with three
+      // multiplications (numbers of up to 7 digits, nearly every index in an export).
+      if (e - p >= 8) {
+        u64 w; memcpy(&w, p, 8);
+        const u64 hi = 0xF0F0F0F0F0F0F0F0ull, lo = 0x0F0F0F0F0F0F0F0Full;
+        u64 nd = ((w & hi) ^ 0x3030303030303030ull) | (((w & lo) + 0x0606060606060606ull) & hi);   // non-zero byte: not a digit
+        unsigned k = nd ? (unsigned)__builtin_ctzll(nd) >> 3 : 8;   // digits before the first non-digit
+        if (k == 0) return false;
+        w = (k == 8 ? w : w << (64 - 8 * k)) & lo;                   // the digits in the top k bytes, as values
+        w = (w * 2561) >> 8;
+        w = ((w & 0x00FF00FF00FF00FFull) * 6553601) >> 16;
+        w = ((w & 0x0000FFFF0000FFFFull) * 42949672960001ull) >> 32;
+        p += k;
+        if (k < 8) { v = w; return true; }
+        while (p < e && *p >= '0' && *p <= '9') { w = w * 10 + (u64)(*p - '0'); p++; }
+        v = w; return true;
+      }
       if (p >= e || *p < '0' || *p > '9') return false;
       u64 x = 0;
       while (p < e && *p >= '0' && *p <= '9') { x = x * 10 + (u64)(*p - '0'); p++; }
