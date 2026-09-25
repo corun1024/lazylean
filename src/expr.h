@@ -18,9 +18,12 @@ struct ExprNode {
   u32 loose_bvar_range;
   u32 a, b, c;         // children / payload (see mk_* below)
   u32 name;            // binder name, const name, proj struct name
-  u32 lvls;            // const: LevelList
-  u64 hash;
+  u32 lvls;            // const: LevelList.  Other kinds: free for a cache (the evaluation engine
+                       // keeps a term's loose-variable mask here, and its high half in `c` for
+                       // app/lam/pi/proj); neither is part of such a node's identity.
+  u32 hash;           // 32 bits: the node is 32 bytes, and there are ~10^8 of them in Mathlib
 };
+static_assert(sizeof(ExprNode) == 32, "ExprNode layout");
 // Payload conventions:
 //  BVar : a = de Bruijn index
 //  FVar : a = fvar id (unique, assigned by the type checker)
@@ -74,15 +77,17 @@ struct ExprTable {
   bool frozen = false;
   size_t wm_nodes = 0, wm_nat = 0, wm_str = 0;
 private:
-  struct H { ExprTable* t; u64 operator()(u32 h) const { return t->nodes[h].hash; } };
+  struct H { ExprTable* t; u64 operator()(u32 h) const { return (u64)t->nodes[h].hash * 0x9E3779B97F4A7C15ull; } };
   // Structural identity is up to binder names and binder infos, as Lean's `Expr` equality and
   // hash are: alpha-equivalent terms intern to the same handle.  The name field still counts for
   // constants and projections, where it is the constant / structure name.
   struct E { ExprTable* t; bool operator()(u32 x, u32 y) const {
     auto& a = t->nodes[x]; auto& b = t->nodes[y];
     if (a.kind == EKind::Clos || b.kind == EKind::Clos) return t->sem_eq(x, y);   // modulo materialisation
-    if (a.kind != b.kind || a.a != b.a || a.b != b.b || a.c != b.c || a.lvls != b.lvls) return false;
-    return (a.kind != EKind::Const && a.kind != EKind::Proj) || a.name == b.name; } };
+    if (a.kind != b.kind || a.a != b.a || a.b != b.b) return false;
+    if (a.kind == EKind::Let && a.c != b.c) return false;   // `c` belongs to a node's identity only for let
+    if (a.kind == EKind::Const) return a.name == b.name && a.lvls == b.lvls;
+    return a.kind != EKind::Proj || a.name == b.name; } };
   struct NH { ExprTable* t; u64 operator()(u32 h) const {
     const mpz_class& v = t->nat_lits[h]; size_t n = mpz_size(v.get_mpz_t()); const mp_limb_t* l = mpz_limbs_read(v.get_mpz_t());
     u64 r = 0x51ED270B + n; for (size_t i = 0; i < n; i++) r = mix(r, (u64)l[i]); return r; } };
@@ -92,7 +97,7 @@ private:
   struct EH { ExprTable* t; u64 operator()(u32 h) const { return t->env_hash[h]; } };
   struct EE { ExprTable* t; bool operator()(u32 x, u32 y) const { return t->envs[x] == t->envs[y]; } };
   InternTable<EH, EE>* etable;
-  InternTable<H, E>* table;  InternTable<H, E>* ttable;    // permanent / temporary
+  InternTable<H, E, true>* table;  InternTable<H, E>* ttable;    // permanent (compact) / temporary
   InternTable<NH, NE>* ntable; InternTable<NH, NE>* tntable;
   InternTable<SH, SE>* stable; InternTable<SH, SE>* tstable;
 };

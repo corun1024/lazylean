@@ -2,6 +2,8 @@
 #include <sys/mman.h>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <algorithm>
 
 namespace ll {
 
@@ -24,12 +26,26 @@ NameTable::NameTable() {
   table = new InternTable<H, E>(H{this}, E{this});
 }
 
+std::string_view NameTable::keep(std::string_view s) {
+  if (s.empty()) return std::string_view();
+  const size_t CHUNK = (size_t)1 << 20;
+  if (s.size() > pool_left) {
+    size_t sz = std::max(CHUNK, s.size());
+    pool_cur = (char*)malloc(sz); pool.push_back(pool_cur); pool_left = sz;
+  }
+  memcpy(pool_cur, s.data(), s.size());
+  std::string_view r(pool_cur, s.size());
+  pool_cur += s.size(); pool_left -= s.size();
+  return r;
+}
+
 Name NameTable::mk_str(Name parent, std::string_view s) {
   u64 h = mix(mix(nodes[parent].hash, 1), hash_str(s));
-  nodes.push_back(NameNode{parent, true, 0, std::string(s), h});
+  nodes.push_back(NameNode{parent, true, 0, s, h});   // the caller's string, while it is looked up
   u32 cand = (u32)nodes.size() - 1;
   u32 r = table->intern(cand);
   if (r != cand) nodes.pop_back();
+  else nodes[cand].str = keep(s);                     // new: copy it into the pool
   return r;
 }
 
@@ -46,7 +62,7 @@ std::string NameTable::to_string(Name n) const {
   if (n == 0) return "[anonymous]";
   const NameNode& nd = nodes[n];
   std::string p = nd.parent == 0 ? "" : to_string(nd.parent) + ".";
-  return p + (nd.is_str ? nd.str : std::to_string(nd.num));
+  return p + (nd.is_str ? std::string(nd.str) : std::to_string(nd.num));
 }
 
 Name NameTable::of_string(std::string_view s) {

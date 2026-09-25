@@ -40,7 +40,7 @@ Name replace_prefix(Name n, Name from, Name to) {
 
 Name append_index_after(Name n, unsigned i) {
   const NameNode nd = (*g_names)[n];
-  if (nd.is_str) return g_names->mk_str(nd.parent, nd.str + "_" + std::to_string(i));
+  if (nd.is_str) return g_names->mk_str(nd.parent, std::string(nd.str) + "_" + std::to_string(i));
   return g_names->mk_num(n, i);
 }
 
@@ -443,7 +443,7 @@ struct AddInductive {
           std::vector<Expr> uargs; get_app_args(uiTy, uargs);
           Expr viTy = g_lctx.mk_pi(xs, mk_app(mk_apps_range(recs[j].motive, uargs, nparams, uargs.size()), mk_apps(ui, xs)));
           const NameNode un = (*g_names)[g_lctx.get(ui).name];
-          Name vname = g_names->mk_str(un.parent, un.str + "_ih");
+          Name vname = g_names->mk_str(un.parent, std::string(un.str) + "_ih");
           v.push_back(g_lctx.push(vname, viTy, BInfo::Default));
         }
         Expr minorTy = g_lctx.mk_pi(bu, g_lctx.mk_pi(v, motive_app));

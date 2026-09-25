@@ -13,7 +13,7 @@ void check_rss(const char* where);   // tc.cpp
 
 ExprTable::ExprTable() {
   nodes.reserve(1 << 20);
-  table = new InternTable<H, E>(H{this}, E{this}, 1 << 20);
+  table = new InternTable<H, E, true>(H{this}, E{this}, 1 << 20);
   ttable = new InternTable<H, E>(H{this}, E{this}, 1 << 16);
   ntable = new InternTable<NH, NE>(NH{this}, NE{this});
   tntable = new InternTable<NH, NE>(NH{this}, NE{this});
@@ -182,7 +182,7 @@ u32 ExprTable::mk_env(const Expr* es, size_t n, bool rev) {
 u32 ExprTable::mk_env_concat(const std::vector<Expr>& parts) { return mk_env(parts.data(), parts.size(), false); }
 
 
-static inline u64 hk(EKind k, u64 x) { return mix((u64)k + 101, x); }
+static inline u32 hk(EKind k, u64 x) { u64 h = mix((u64)k + 101, x); return (u32)(h ^ (h >> 32)); }
 
 Expr mk_bvar(u32 idx) {
   return g_exprs->intern(ExprNode{EKind::BVar, BInfo::Default, 0, idx + 1, idx, 0, 0, 0, 0, hk(EKind::BVar, idx)});
@@ -194,29 +194,29 @@ Expr mk_sort(Level l) {
   return g_exprs->intern(ExprNode{EKind::Sort, BInfo::Default, (u8)(lv(l).has_param ? 2 : 0), 0, l, 0, 0, 0, 0, hk(EKind::Sort, lv(l).hash)});
 }
 Expr mk_const(Name n, LevelList ls) {
-  u64 h = hk(EKind::Const, mix((*g_names)[n].hash, ls));
+  u32 h = hk(EKind::Const, mix((*g_names)[n].hash, ls));
   return g_exprs->intern(ExprNode{EKind::Const, BInfo::Default, (u8)(g_levels->list_has_param(ls) ? 2 : 0), 0, 0, 0, 0, n, ls, h});
 }
 static ExprNode node_app(Expr f, Expr a) {
   const ExprNode nf = raw(f); const ExprNode na = raw(a);
-  u64 h = hk(EKind::App, mix(nf.hash, na.hash));
+  u32 h = hk(EKind::App, mix(nf.hash, na.hash));
   return ExprNode{EKind::App, BInfo::Default, (u8)(nf.flags | na.flags), std::max(nf.loose_bvar_range, na.loose_bvar_range), f, a, 0, 0, 0, h};
 }
 static ExprNode node_binding(EKind k, Name n, Expr dom, Expr body, BInfo bi) {
   const ExprNode nd = raw(dom); const ExprNode nb = raw(body);
   u32 lbr = std::max(nd.loose_bvar_range, nb.loose_bvar_range > 0 ? nb.loose_bvar_range - 1 : 0);
-  u64 h = hk(k, mix(nd.hash, nb.hash));
+  u32 h = hk(k, mix(nd.hash, nb.hash));
   return ExprNode{k, bi, (u8)(nd.flags | nb.flags), lbr, dom, body, 0, n, 0, h};
 }
 static ExprNode node_let(Name n, Expr type, Expr val, Expr body) {
   const ExprNode nt = raw(type); const ExprNode nv = raw(val); const ExprNode nb = raw(body);
   u32 lbr = std::max({nt.loose_bvar_range, nv.loose_bvar_range, nb.loose_bvar_range > 0 ? nb.loose_bvar_range - 1 : 0});
-  u64 h = hk(EKind::Let, mix(mix(nt.hash, nv.hash), nb.hash));
+  u32 h = hk(EKind::Let, mix(mix(nt.hash, nv.hash), nb.hash));
   return ExprNode{EKind::Let, BInfo::Default, (u8)(nt.flags | nv.flags | nb.flags), lbr, type, val, body, n, 0, h};
 }
 static ExprNode node_proj(Name s, u32 idx, Expr e) {
   const ExprNode ne = raw(e);
-  u64 h = hk(EKind::Proj, mix(mix((*g_names)[s].hash, idx), ne.hash));
+  u32 h = hk(EKind::Proj, mix(mix((*g_names)[s].hash, idx), ne.hash));
   return ExprNode{EKind::Proj, BInfo::Default, ne.flags, ne.loose_bvar_range, idx, e, 0, s, 0, h};
 }
 Expr mk_app(Expr f, Expr a) { return g_exprs->intern(node_app(f, a)); }
@@ -229,7 +229,7 @@ Expr bulk_app(Expr f, Expr a) {
   const ExprNode* nd = T.nodes.data();
   const u8 fl = nd[f].flags | nd[a].flags;
   const u32 lbr = std::max(nd[f].loose_bvar_range, nd[a].loose_bvar_range);
-  const u64 h = hk(EKind::App, mix(nd[f].hash, nd[a].hash));
+  const u32 h = hk(EKind::App, mix(nd[f].hash, nd[a].hash));
   T.nodes.push_back(ExprNode{EKind::App, BInfo::Default, fl, lbr, f, a, 0, 0, 0, h});
   return (u32)T.nodes.size() - 1;
 }
@@ -356,7 +356,7 @@ bool view_eq(ExprTable& T, View x, View y) {
     case EKind::Proj: r = a.name == b.name && a.a == b.a && sub(a.b, b.b, 0); break;
     case EKind::BVar: r = a.a == b.a; break;             // both untouched (i < p on each side)
     case EKind::Const: r = a.name == b.name && a.lvls == b.lvls; break;
-    default: r = a.a == b.a && a.b == b.b && a.c == b.c && a.lvls == b.lvls; break;
+    default: r = a.a == b.a && a.b == b.b && a.c == b.c; break;
   }
   if (r) g_eqmemo.key[slot] = k;
   return r;
@@ -401,7 +401,7 @@ Expr mk_clos(Expr t, u32 env, u32 p) {
   g_cnt_clos++;
   u32 lbr = 0; u8 fl = 0;
   u64 h = g_exprs->sem_hash(t, env, p, &lbr, &fl);   // exact range and flags of the expansion (has_fvar must not over-approximate)
-  return g_exprs->intern(ExprNode{EKind::Clos, BInfo::Default, fl, lbr, t, env, p, NIL, NIL, h});
+  return g_exprs->intern(ExprNode{EKind::Clos, BInfo::Default, fl, lbr, t, env, p, NIL, NIL, (u32)h});
 }
 
 Expr ExprTable::expose(Expr e) {

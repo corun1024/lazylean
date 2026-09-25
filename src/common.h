@@ -7,6 +7,7 @@
 #include <vector>
 #include <stdexcept>
 #include <utility>
+#include <type_traits>
 
 namespace ll {
 
@@ -128,17 +129,22 @@ struct FlatSet64 {
 // data read in random order, and with 4 KB pages nearly every lookup also misses the TLB.
 void advise_huge(void* p, size_t bytes);
 
-template <class HashFn, class EqFn>
+template <class HashFn, class EqFn, bool Compact = false>
 struct InternTable {
   // Open addressing, linear probing.  Each slot packs the upper 32 bits of the hash with the
   // handle, so a probe only touches the element (a random access into the node table) when the
-  // tag matches.
-  static constexpr u64 EMPTY = ~0ull;
-  std::vector<u64> slots;
+  // tag matches.  A Compact table stores the bare handle (4 bytes a slot, half the memory), and
+  // every probe of an occupied slot compares the element: for the permanent expression index,
+  // which after loading is probed only when the reference checker builds a term.
+  using Slot = std::conditional_t<Compact, u32, u64>;
+  static constexpr Slot EMPTY = (Slot)~(Slot)0;
+  std::vector<Slot> slots;
   size_t count = 0;
   HashFn hashfn; EqFn eqfn;
   InternTable(HashFn h, EqFn e, size_t cap = 1 << 16) : hashfn(h), eqfn(e) { slots.assign(cap, EMPTY); }
-  static u64 pack(u64 hv, u32 h) { return (hv & 0xffffffff00000000ull) | h; }
+  static Slot pack(u64 hv, u32 h) { if constexpr (Compact) { (void)hv; return h; } else return (hv & 0xffffffff00000000ull) | h; }
+  // a cheap filter before the equality test: the tag, or (compact) the element's own hash
+  bool tag_ok(Slot s, u64 hv) const { if constexpr (Compact) return hashfn((u32)s) == hv; else return (s & 0xffffffff00000000ull) == (hv & 0xffffffff00000000ull); }
   // Returns existing equal handle, or inserts h and returns h.
   size_t gen = 0;   // bumped by grow(); an equality test may intern recursively
   // A temporary table records the slots it fills, so that emptying it after a declaration
@@ -151,15 +157,15 @@ struct InternTable {
   }
   u32 intern(u32 h) {
     if ((count + 1) * 4 >= slots.size() * 3) grow();
-    u64 hv = hashfn(h), tag = hv & 0xffffffff00000000ull;
+    u64 hv = hashfn(h);
   restart:
     size_t mask = slots.size() - 1;
     size_t i = hv & mask;
     size_t g0 = gen;
     while (true) {
-      u64 s = slots[i];
+      Slot s = slots[i];
       if (s == EMPTY) { slots[i] = pack(hv, h); count++; if (track) dirty.push_back((u32)i); return h; }
-      if ((s & 0xffffffff00000000ull) == tag) {
+      if (tag_ok(s, hv)) {
         bool eq = eqfn((u32)s, h);
         if (eq) return (u32)s;
         if (gen != g0) goto restart;
@@ -169,13 +175,13 @@ struct InternTable {
   }
   // Returns the existing equal handle or NIL; never inserts.
   u32 find(u32 h) const {
-    u64 hv = hashfn(h), tag = hv & 0xffffffff00000000ull;
+    u64 hv = hashfn(h);
     size_t mask = slots.size() - 1;
     size_t i = hv & mask;
     while (true) {
-      u64 s = slots[i];
+      Slot s = slots[i];
       if (s == EMPTY) return NIL;
-      if ((s & 0xffffffff00000000ull) == tag && eqfn((u32)s, h)) return (u32)s;
+      if (tag_ok(s, hv) && eqfn((u32)s, h)) return (u32)s;
       i = (i + 1) & mask;
     }
   }
@@ -185,16 +191,16 @@ struct InternTable {
   void bulk_insert(u32 lo, u32 hi, bool* dup) {
     const size_t mask = slots.size() - 1;
     for (u32 h = lo; h < hi; h++) {
-      u64 hv = hashfn(h), tag = hv & 0xffffffff00000000ull, want = pack(hv, h);
+      u64 hv = hashfn(h); Slot want = pack(hv, h);
       size_t i = hv & mask;
       while (true) {
-        u64 s = __atomic_load_n(&slots[i], __ATOMIC_RELAXED);
+        Slot s = __atomic_load_n(&slots[i], __ATOMIC_RELAXED);
         if (s == EMPTY) {
-          u64 exp = EMPTY;
+          Slot exp = EMPTY;
           if (__atomic_compare_exchange_n(&slots[i], &exp, want, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) break;
           continue;   // lost the race for this slot: look at it again
         }
-        if ((s & 0xffffffff00000000ull) == tag && eqfn((u32)s, h)) { __atomic_store_n(dup, true, __ATOMIC_RELAXED); break; }
+        if (tag_ok(s, hv) && eqfn((u32)s, h)) { __atomic_store_n(dup, true, __ATOMIC_RELAXED); break; }
         i = (i + 1) & mask;
       }
     }
@@ -205,9 +211,9 @@ struct InternTable {
     while (n * 4 >= want * 3) want *= 2;
     if (want == slots.size()) return;
     if (count == 0) {
-      std::vector<u64>().swap(slots);
+      std::vector<Slot>().swap(slots);
       slots.reserve(want);
-      advise_huge(slots.data(), want * sizeof(u64));
+      advise_huge(slots.data(), want * sizeof(Slot));
       slots.assign(want, EMPTY);
       return;
     }
@@ -215,11 +221,11 @@ struct InternTable {
   }
   void grow() {
     gen++;
-    std::vector<u64> old; old.swap(slots);
+    std::vector<Slot> old; old.swap(slots);
     slots.assign(old.size() * 2, EMPTY);
     size_t mask = slots.size() - 1;
     if (track) dirty.clear();
-    for (u64 s : old) if (s != EMPTY) {
+    for (Slot s : old) if (s != EMPTY) {
       size_t i = hashfn((u32)s) & mask;
       while (slots[i] != EMPTY) i = (i + 1) & mask;
       slots[i] = s;

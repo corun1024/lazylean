@@ -8,7 +8,7 @@ struct NameNode {
   Name parent;
   bool is_str;
   u64 num;        // for numeric components
-  std::string str;
+  std::string_view str;   // into the table's character pool (stable: the pool never moves)
   u64 hash;
 };
 
@@ -30,6 +30,9 @@ private:
     auto& x = t->nodes[a]; auto& y = t->nodes[b];
     return x.parent == y.parent && x.is_str == y.is_str && x.num == y.num && x.str == y.str; } };
   InternTable<H, E>* table;
+  // component strings, packed into chunks that are never moved or freed
+  std::vector<char*> pool; size_t pool_left = 0; char* pool_cur = nullptr;
+  std::string_view keep(std::string_view s);
 };
 
 extern NameTable* g_names;
