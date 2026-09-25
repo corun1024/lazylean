@@ -14,8 +14,8 @@ Krivine machine with call-by-need thunks, after Coq's `cClosure`. That checker's
 final, so the evaluator only ever has to be right when it accepts.
 
 On the Lean Kernel Arena's ranking measure, the instructions executed to check all of Mathlib,
-lazylean 0.4.0 needs 0.49 × 10¹² instructions for 654 504 declarations, on one core, in under
-four minutes: a third less than the fastest checker of the 2026-09 round and eleven times less
+lazylean 0.4.1 needs 0.46 × 10¹² instructions for 654 504 declarations, on one core, in under
+four minutes: a third less than the fastest checker of the 2026-09 round and twelve times less
 than lazylean 0.3.0. On the Four Colour Theorem's 201 672-declaration dependency closure the
 lazy machine needs 3.9 core-hours where Lean's kernel needs 7.5, and where Lean's kernel dies at
 178 GB on a raw port of Gonthier's reducibility check, it finishes in 21 GB.
@@ -89,7 +89,7 @@ computed once), so a subterm's value is shared by every context that agrees on i
 variables. Measured on Std, pruning turned 41% of evaluation misses into hits.
 
 **Sessions.** Values live in a bump arena, and the arena and every cache last for a *session*
-of about a gigabyte of values -- tens of thousands of declarations -- rather than for one
+of about 1.5 GB of values -- tens of thousands of declarations -- rather than for one
 declaration. The environment only grows and a value means the same thing wherever it is used, so
 a constant's type, an instance's unfolding or a conversion already decided is paid for once per
 session. The caches are open-addressing tables whose memory is mapped once, 2 MB-aligned and
@@ -329,7 +329,7 @@ end.
 
 ## Performance
 
-### Version 0.4.0: instructions, the arena's measure
+### Version 0.4: instructions, the arena's measure
 
 The Lean Kernel Arena ranks checkers first by their verdicts and then by the number of
 instructions (`perf stat -e instructions`, summed over every thread and process) they execute
@@ -337,18 +337,18 @@ on the Mathlib export; its time columns are that count divided by 6 × 10⁹. Wa
 enter the ranking, and neither does the number of cores, which is why 0.4.0 runs as a single
 process. Billions of instructions, all declarations accepted in every run:
 
-| corpus | declarations | lazylean 0.3.0 | mathgraph | sokonanoda | nanoclo | Lean's kernel | lazylean 0.4.0 |
+| corpus | declarations | lazylean 0.3.0 | mathgraph | sokonanoda | nanoclo | Lean's kernel | lazylean 0.4.1 |
 |---|---|---|---|---|---|---|---|
-| Init | 53 093 | 213 | 37 | 39 | 121 | 367 | **22** |
-| Std | 90 778 | 351 | 62 | 65 | 201 | 617 | **37** |
-| con-leche | 26 819 | 457 | 157 | 162 | 315 | 665 | **76** |
-| CSLib | 370 939 | 1 248 | 237 | 249 | 775 | 2 428 | **148** |
-| Mathlib | 654 504 | 5 529 | 709 | 745 | 3 064 | 11 832 | **485** |
+| Init | 53 093 | 213 | 37 | 39 | 121 | 367 | **21** |
+| Std | 90 778 | 351 | 62 | 65 | 201 | 617 | **36** |
+| con-leche | 26 819 | 457 | 157 | 162 | 315 | 665 | **75** |
+| CSLib | 370 939 | 1 248 | 237 | 249 | 775 | 2 428 | **141** |
+| Mathlib | 654 504 | 5 529 | 709 | 745 | 3 064 | 11 832 | **464** |
 
-The other columns are the arena's own figures from round 2026-09; lazylean 0.4.0 was measured
+The other columns are the arena's own figures from round 2026-09; lazylean 0.4.1 was measured
 the same way (`perf stat -e instructions`, single process, `-k`) on a 64-core AMD EPYC 7B13 VM.
-On Mathlib that is 81 s of the arena's virtual time against 118 s for the round's fastest
-checker; the real run takes 197 s of wall clock on one core and peaks at 10.9 GB.
+On Mathlib that is 77 s of the arena's virtual time against 118 s for the round's fastest
+checker; the real run takes 198 s of wall clock on one core and peaks at 11.2 GB.
 
 Where the eleven-fold reduction on Mathlib came from, in the order it was made: the evaluation
 engine itself (5.5 → 0.92 × 10¹²), reusing its memory across sessions instead of returning it
@@ -356,7 +356,8 @@ to the kernel (→ 0.71), pruned environments as cache keys (→ 0.69), a loader
 line in one pass and appends nodes without a lookup, and memoised universe-level normalisation,
 which had been a fifth of the time on late Mathlib because it compared parameter names through
 heap-allocated vectors (→ 0.58), and walking a function's type as a telescope without building
-the intermediate Π values (→ 0.49).
+the intermediate Π values (→ 0.49), and in 0.4.1 reading the export's numbers eight bytes at a
+time and longer sessions (→ 0.46).
 
 
 ### Version 0.3.0 (wall clock)
